@@ -1,34 +1,33 @@
-"""Fast-path routing: disfluency detection and deterministic cleanup."""
-from whisperflow_local.textproc import needs_llm_cleanup, quick_clean, to_hk
+"""LLM routing and the deterministic cleanup used when the LLM is off/down."""
+from whisperflow_local.textproc import quick_clean, should_use_llm, to_hk
 
 
 # ------------------------------------------------------------ routing
 
-def test_clean_speech_skips_llm():
-    assert not needs_llm_cleanup("幫我 send 個 email 俾 David")
-    assert not needs_llm_cleanup("book a table for two at eight")
+def test_clean_profile_routes_to_llm_even_for_fluent_speech():
+    # Regression: ASR homophone slips (影得→認得, 中影→中英) carry no
+    # disfluency marker, so routing on disfluencies starved the LLM of
+    # exactly the text it exists to fix. Non-Raw profiles always route
+    # to the LLM when it is enabled (SPEC C2).
+    assert should_use_llm(True, "Clean", "幫我 send 個 email 俾 David")
+    assert should_use_llm(True, "Clean", "book a table for two at eight")
 
 
-def test_fillers_route_to_llm():
-    assert needs_llm_cleanup("um let me think about it")
-    assert needs_llm_cleanup("so uh we should go")
-    assert needs_llm_cleanup("呃我想講嘅係")
-    assert needs_llm_cleanup("嗯好啊")
-    assert needs_llm_cleanup("即係我想話俾你知")
+def test_all_non_raw_profiles_use_llm():
+    for profile in ("Clean", "Email", "Message", "Notes"):
+        assert should_use_llm(True, profile, "今晚八點食飯")
 
 
-def test_latin_stutter_routes_to_llm():
-    assert needs_llm_cleanup("send the the email")
+def test_raw_profile_never_uses_llm():
+    assert not should_use_llm(True, "Raw", "keep exactly as spoken")
 
 
-def test_cjk_reduplication_is_not_a_stutter():
-    # 試試/謝謝-style reduplication is grammatical Cantonese/Chinese.
-    assert not needs_llm_cleanup("等我試試先")
-    assert not needs_llm_cleanup("多謝謝謝")
+def test_llm_disabled_skips_llm():
+    assert not should_use_llm(False, "Clean", "幫我 send 個 email")
 
 
-def test_filler_words_inside_english_words_do_not_trigger():
-    assert not needs_llm_cleanup("the drummer hums a tune")  # um/hmm embedded
+def test_empty_text_skips_llm():
+    assert not should_use_llm(True, "Clean", "   ")
 
 
 # ------------------------------------------------------------ quick_clean

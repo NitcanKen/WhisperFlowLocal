@@ -11,4 +11,5 @@ funasr>=1.1.4
 modelscope>=1.15.0
 qwen-asr>=0.0.6
 opencc-python-reimplemented>=0.1.7
+ToJyutping>=3.0
 pytest>=8.0

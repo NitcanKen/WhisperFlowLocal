@@ -66,32 +66,20 @@ def apply_dictionary(text: str, entries: list) -> str:
     return text
 
 
-# ------------------------------------------------------- fast-path cleanup
-# Clean speech skips the LLM entirely (the ~1.3 s latency budget cannot fit
-# a 4B decode): deterministic script conversion + spacing + vocabulary
-# casing. Utterances with disfluencies still route to the LLM.
-
-_LATIN_FILLER_RE = re.compile(
-    r"(?:(?<=^)|(?<=[\s,，。.!?！？]))(?:um+|uh+|erm?|hmm+)"
-    r"(?=$|[\s,，。.!?！？])",
-    re.IGNORECASE,
-)
-_CJK_FILLER_RE = re.compile(r"[呃嗯]|即係")
-_LATIN_STUTTER_RE = re.compile(r"\b([a-zA-Z]+)\s+\1\b", re.IGNORECASE)
+# ------------------------------------------------- LLM routing + cleanup
+# Non-Raw profiles always route to the LLM when it is enabled: ASR errors
+# (Cantonese homophone slips, misheard English terms) carry no surface
+# marker a regex can detect — only the LLM can judge them from context.
+# quick_clean is the deterministic degradation path when the LLM is
+# disabled or Ollama is unreachable, not a routing choice.
 
 _CJK = r"一-鿿"
 _CC_S2HK = None
 
 
-def needs_llm_cleanup(text: str) -> bool:
-    """True when the utterance has disfluencies only an LLM can judge
-    (fillers, '即係' which may or may not be filler, Latin stutters).
-    CJK reduplication ('試試', '謝謝') is grammatical, so it never triggers."""
-    return bool(
-        _LATIN_FILLER_RE.search(text)
-        or _CJK_FILLER_RE.search(text)
-        or _LATIN_STUTTER_RE.search(text)
-    )
+def should_use_llm(llm_enabled: bool, profile: str, text: str) -> bool:
+    """Route every non-empty, non-Raw utterance to the LLM when enabled."""
+    return bool(llm_enabled and profile != "Raw" and text and text.strip())
 
 
 def to_hk(text: str) -> str:
@@ -128,6 +116,105 @@ def quick_clean(text: str, vocab: list = None, hk: bool = True) -> str:
                 re.IGNORECASE,
             )
             text = pattern.sub(term, text)
+    return text.strip()
+
+
+# ------------------------------------------------------------- edit guards
+# The Clean profile's LLM proposes {"from","to"} edits; only edits that pass
+# every guard below are applied. qwen3.5:4b hallucinates edits (translations,
+# variant-character churn, sentence rewrites — all observed live), so the
+# guards, not the prompt, are what make the layer safe.
+
+_CJK_CHAR_RE = re.compile(f"[{_CJK}]")
+_FILLERS = {"呃", "嗯", "um", "uh"}
+_CC_T2S = None
+_JYUTPING = None
+
+
+def _t2s(text: str) -> str:
+    """Any-variant → simplified, used to detect same-word spelling churn."""
+    global _CC_T2S
+    if _CC_T2S is None:
+        try:
+            from opencc import OpenCC
+            _CC_T2S = OpenCC("t2s")
+        except Exception:
+            _CC_T2S = False
+    return _CC_T2S.convert(text) if _CC_T2S else text
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _phonetically_close(src: str, dst: str) -> bool:
+    """Enforce the near-homophone contract on the CJK part of an edit:
+    toneless jyutping within edit distance 2. 影得→認得 (jing/jing) passes;
+    影得→錄得 (jing/luk) is a wrong-guess and is rejected. Latin parts are
+    exempt (vocabulary recovery like Word→hot word has no jyutping)."""
+    global _JYUTPING
+    if _JYUTPING is None:
+        try:
+            import ToJyutping
+            _JYUTPING = ToJyutping
+        except Exception:
+            _JYUTPING = False
+    if not _JYUTPING:
+        return True  # no phonetic data available — other guards still apply
+    a = "".join(_CJK_CHAR_RE.findall(src))
+    b = "".join(_CJK_CHAR_RE.findall(dst))
+    jp_a = re.sub(r"[0-9 ]", "", _JYUTPING.get_jyutping_text(a))
+    jp_b = re.sub(r"[0-9 ]", "", _JYUTPING.get_jyutping_text(b))
+    if not jp_a or not jp_b:
+        return True
+    return _levenshtein(jp_a, jp_b) <= 2
+
+
+def _edit_is_safe(src: str, dst: str, text: str) -> bool:
+    if not src or src == dst or src not in text:
+        return False
+    if not dst:  # deletion: only known fillers may be removed
+        return src.lower() in _FILLERS
+    if len(src) > 12:
+        return False  # sentence rewrite smuggled into one edit
+    src_cjk = bool(_CJK_CHAR_RE.search(src))
+    dst_cjk = bool(_CJK_CHAR_RE.search(dst))
+    if src_cjk != dst_cjk:
+        return False  # cross-script swap = translation, not a homophone fix
+    if src_cjk:
+        if len(_CJK_CHAR_RE.findall(src)) < 2:
+            return False  # single-char CJK replace-all is too blunt to trust
+        if len(dst) > len(src) + 2:
+            return False
+        if _t2s(src) == _t2s(dst):
+            return False  # variant/script churn (個→箇), same word either way
+        if not _phonetically_close(src, dst):
+            return False
+    else:
+        # Latin-only: longer targets allowed (misheard term → vocab phrase).
+        if len(src) < 3 or len(dst) > len(src) + 10:
+            return False
+    return True
+
+
+def apply_edits(text: str, edits: list) -> str:
+    """Apply the LLM's correction edits, dropping any that fail the guards.
+    A hallucinated edit degrades to a no-op — output is never corrupted."""
+    for edit in edits or []:
+        src = str(edit.get("from", ""))
+        dst = str(edit.get("to", ""))
+        if _edit_is_safe(src, dst, text):
+            text = text.replace(src, dst)
+    text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
 
 

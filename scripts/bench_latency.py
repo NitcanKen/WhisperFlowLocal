@@ -27,13 +27,12 @@ import soundfile as sf  # noqa: E402
 from whisperflow_local.asr import ASREngine  # noqa: E402
 from whisperflow_local.config import Config  # noqa: E402
 from whisperflow_local.injector import insert  # noqa: E402
-from whisperflow_local.llm import LLMClient  # noqa: E402
+from whisperflow_local.llm import LLMClient, LLMUnavailable  # noqa: E402
 from whisperflow_local.textproc import (  # noqa: E402
     apply_dictionary,
-    needs_llm_cleanup,
+    apply_edits,
     parse_voice_commands,
     quick_clean,
-    to_hk,
     vocab_terms,
 )
 
@@ -46,9 +45,8 @@ def pipeline_once(audio, asr, cfg, llm, mode):
     """One full recording-stop -> output-complete pass, mirroring
     app._process_audio routing. Returns (dt, text).
 
-    mode: "default" (smart route, what the app ships)
-          | "llm"   (LLM forced, worst case)
-          | "raw"   (no LLM, no fast-path cleanup)
+    mode: "default" (what the app ships: LLM Clean, quick_clean on failure)
+          | "raw"   (no LLM, no cleanup)
     """
     from whisperflow_local import paths
     from whisperflow_local.audio import save_wav
@@ -61,12 +59,13 @@ def pipeline_once(audio, asr, cfg, llm, mode):
     text = apply_dictionary(raw, cfg.get("dictionary"))
     parsed = parse_voice_commands(text)
     formatted = parsed.text
-    if mode == "default" and not needs_llm_cleanup(formatted):
+    if mode == "default":
         formatted = quick_clean(formatted, vocab=vocab, hk=hk)
-    elif mode in ("default", "llm"):
-        formatted = llm.format_text(formatted, "Clean", vocab=vocab)
-        if hk:
-            formatted = to_hk(formatted)
+        try:
+            edits = llm.propose_edits(formatted, vocab=vocab)
+            formatted = apply_edits(formatted, edits)
+        except LLMUnavailable:
+            pass  # quick_clean output already stands on its own
     insert(formatted, copy_only=True)  # test sink: clipboard, no focus needed
     return time.perf_counter() - t0, formatted
 
@@ -101,15 +100,11 @@ def main():
         print("WARNING: Ollama unreachable — LLM rows will be skipped")
 
     rows = []
-    llm_up = llm.ping()
     for engine_name in args.engines.split(","):
         asr = ASREngine(engine_name)
         asr.ensure_loaded()
-        rows.append(bench(f"{engine_name} default (smart route)", audio,
+        rows.append(bench(f"{engine_name} default (LLM Clean)", audio,
                           asr, cfg, llm, mode="default", runs=args.runs))
-        if llm_up:
-            rows.append(bench(f"{engine_name} LLM forced", audio,
-                              asr, cfg, llm, mode="llm", runs=args.runs))
         rows.append(bench(f"{engine_name} raw (no LLM)", audio,
                           asr, cfg, llm, mode="raw", runs=args.runs))
 

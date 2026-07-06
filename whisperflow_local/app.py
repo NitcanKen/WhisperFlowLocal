@@ -31,11 +31,12 @@ from .overlay import WaveformOverlay
 from .sounds import play
 from .textproc import (
     apply_dictionary,
-    needs_llm_cleanup,
+    apply_edits,
     parse_vocab_entry,
     parse_voice_commands,
     pick_profile,
     quick_clean,
+    should_use_llm,
     strip_punctuation,
     to_hk,
     vocab_terms,
@@ -378,7 +379,7 @@ class WhisperFlowApp(rumps.App):
                 progress_cb=lambda m: setattr(self, "state_msg", m))
             self.state = "idle"
             self.state_msg = tr("status_ready")
-            log("model", "SenseVoiceSmall loaded; app ready")
+            log("model", f"{self.asr.engine_name} loaded; app ready")
         except Exception as exc:
             self.state = "error"
             self.state_msg = f"{tr('notify_model_fail')}: {exc}"
@@ -404,7 +405,9 @@ class WhisperFlowApp(rumps.App):
         log("audio", f"{duration_seconds(audio):.1f}s captured")
         raw = self.asr.transcribe(wav, self.config.get("language"),
                                   context=self._vocab_list())
-        log("asr", raw if raw.strip() else "(empty)")
+        # engine_name is read after transcribe so a mid-call fallback shows.
+        log("asr", f"({self.asr.engine_name}) "
+                   + (raw if raw.strip() else "(empty)"))
         if not raw.strip():
             self.state = "idle"
             self.state_msg = tr("status_heard_nothing")
@@ -430,26 +433,36 @@ class WhisperFlowApp(rumps.App):
 
         formatted = parsed.text
         hk = self.config.get("traditional_hk")
-        use_llm = (self.config.get("llm_enabled") and profile != "Raw"
-                   and parsed.text)
-        if use_llm and profile == "Clean" and not needs_llm_cleanup(parsed.text):
-            # Fast path: clean speech needs no LLM judgement — deterministic
-            # cleanup keeps end-to-end latency inside the 1.3 s budget.
-            formatted = quick_clean(parsed.text, vocab=self._vocab_list(), hk=hk)
-            log("route", "fast path (no disfluencies)")
-        elif use_llm:
+        if should_use_llm(self.config.get("llm_enabled"), profile, parsed.text):
             self.state = "formatting"
             self.state_msg = f"{tr('status_formatting')} ({profile})…"
             try:
-                formatted = self.llm.format_text(parsed.text, profile,
-                                                 vocab=self._vocab_list())
-                if hk:
-                    formatted = to_hk(formatted)
+                if profile == "Clean":
+                    # Guarded edit list, not a rewrite: qwen3.5:4b corrupts
+                    # Cantonese when asked to regenerate whole sentences.
+                    base = quick_clean(parsed.text,
+                                       vocab=self._vocab_list(), hk=hk)
+                    edits = self.llm.propose_edits(base,
+                                                   vocab=self._vocab_list())
+                    formatted = apply_edits(base, edits)
+                    log("route", f"llm edits ({self.llm.model}): "
+                                 f"{edits if edits else 'none'}")
+                else:
+                    formatted = self.llm.format_text(parsed.text, profile,
+                                                     vocab=self._vocab_list())
+                    if hk:
+                        formatted = to_hk(formatted)
+                    log("route", f"llm rewrite ({profile}, {self.llm.model})")
             except LLMUnavailable as exc:
                 formatted = quick_clean(parsed.text,
                                         vocab=self._vocab_list(), hk=hk)
+                log("route", f"quick_clean fallback — {exc}")
                 self.state_msg = tr("status_llm_off_raw", err=exc)
                 _notify(tr("notify_ollama_title"), str(exc))
+        elif profile != "Raw" and parsed.text:
+            # LLM toggled off: deterministic cleanup so 繁體/spacing still apply.
+            formatted = quick_clean(parsed.text, vocab=self._vocab_list(), hk=hk)
+            log("route", "quick_clean (LLM disabled)")
 
         if not self.config.get("punctuation") and formatted:
             formatted = strip_punctuation(formatted)
