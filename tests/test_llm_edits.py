@@ -84,7 +84,26 @@ def test_wrong_guess_fails_phonetic_guard():
     assert apply_edits(text, [{"from": "影得", "to": "錄得"}]) == text
 
 
-def test_latin_vocab_recovery_allows_longer_target():
+def test_latin_edit_allowed_only_toward_declared_vocab():
+    # Word -> hot word is a real recovery ONLY because "hot word" is a
+    # declared vocabulary term, passed via apply_edits' vocab argument.
     out = apply_edits("一隻字咁樣去入 Word 度",
-                      [{"from": "Word", "to": "hot word"}])
+                      [{"from": "Word", "to": "hot word"}],
+                      vocab=["hot word"])
     assert out == "一隻字咁樣去入 hot word 度"
+
+
+def test_latin_edit_not_in_vocab_is_rejected():
+    # The 4B model "correcting" send -> sent must be blocked: sent is not a
+    # declared term, so it is an invented change that makes output worse.
+    text = "幫我 send 個 email 俾 David"
+    assert apply_edits(text, [{"from": "send", "to": "sent"}]) == text
+    assert apply_edits(text, [{"from": "send", "to": "sent"}],
+                       vocab=["WhisperFlow"]) == text
+
+
+def test_mixed_span_cannot_smuggle_latin_change_past_phonetic_guard():
+    # 要 book 埋 -> 要 put 埋: CJK is identical so the jyutping guard would
+    # pass, but the embedded English changed. A CJK edit may only change CJK.
+    text = "仲要 book 埋 table"
+    assert apply_edits(text, [{"from": "要 book 埋", "to": "要 put 埋"}]) == text

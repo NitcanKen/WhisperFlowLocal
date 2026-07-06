@@ -201,7 +201,19 @@ class LLMClient:
                 "\n\n用戶常用詞（如果原文有片段係呢啲詞嘅近音誤寫，"
                 "改返做呢個寫法）：" + "、".join(vocab)
             )
-        return parse_edits(self._chat(system, text, force_json=True))
+        # Phonetic hint: give the model each character's Cantonese reading so it
+        # judges homophones by sound, not by guessing (phonetic-guided
+        # correction beats blind rewrite). Defensive import so a missing
+        # ToJyutping never breaks the correction path.
+        user = text
+        try:
+            from .textproc import jyutping_hint
+            hint = jyutping_hint(text)
+            if hint:
+                user = f"{text}\n\n（每個字嘅粵拼讀音，供你判斷同音字用）：{hint}"
+        except Exception:
+            pass
+        return parse_edits(self._chat(system, user, force_json=True))
 
     def run_command(self, command: str, text: str) -> str:
         system = AI_COMMANDS.get(command)

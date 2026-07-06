@@ -126,6 +126,7 @@ def quick_clean(text: str, vocab: list = None, hk: bool = True) -> str:
 # guards, not the prompt, are what make the layer safe.
 
 _CJK_CHAR_RE = re.compile(f"[{_CJK}]")
+_LATIN_RUN_RE = re.compile(r"[A-Za-z0-9]+")
 _FILLERS = {"呃", "嗯", "um", "uh"}
 _CC_T2S = None
 _JYUTPING = None
@@ -156,11 +157,8 @@ def _levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 
-def _phonetically_close(src: str, dst: str) -> bool:
-    """Enforce the near-homophone contract on the CJK part of an edit:
-    toneless jyutping within edit distance 2. 影得→認得 (jing/jing) passes;
-    影得→錄得 (jing/luk) is a wrong-guess and is rejected. Latin parts are
-    exempt (vocabulary recovery like Word→hot word has no jyutping)."""
+def _jyutping():
+    """Lazy ToJyutping handle; False if the package is unavailable."""
     global _JYUTPING
     if _JYUTPING is None:
         try:
@@ -168,18 +166,47 @@ def _phonetically_close(src: str, dst: str) -> bool:
             _JYUTPING = ToJyutping
         except Exception:
             _JYUTPING = False
-    if not _JYUTPING:
+    return _JYUTPING
+
+
+def _toneless_syllables(text: str) -> list:
+    """Per-character (char, toneless-jyutping-or-None). Non-CJK chars → None.
+    Empty list if ToJyutping is unavailable."""
+    j = _jyutping()
+    if not j:
+        return []
+    return [(ch, re.sub(r"[0-9]", "", jp) if jp else None)
+            for ch, jp in j.get_jyutping_list(text)]
+
+
+def _toneless_jp(text: str) -> str:
+    """Toneless jyutping of a string's CJK content, syllables concatenated."""
+    return "".join(s for _, s in _toneless_syllables(text) if s)
+
+
+def jyutping_hint(text: str) -> str:
+    """Per-CJK-character reading annotation ('識=sik 別=bit'), so the LLM can
+    reason about homophones. Empty when ToJyutping is unavailable or there is
+    no CJK content."""
+    parts = [f"{ch}={s}" for ch, s in _toneless_syllables(text) if s]
+    return " ".join(parts)
+
+
+def _phonetically_close(src: str, dst: str) -> bool:
+    """Enforce the near-homophone contract on the CJK part of an edit:
+    toneless jyutping within edit distance 2. 影得→認得 (jing/jing) passes;
+    影得→錄得 (jing/luk) is a wrong-guess and is rejected. Latin parts are
+    exempt (vocabulary recovery like Word→hot word has no jyutping)."""
+    if not _jyutping():
         return True  # no phonetic data available — other guards still apply
-    a = "".join(_CJK_CHAR_RE.findall(src))
-    b = "".join(_CJK_CHAR_RE.findall(dst))
-    jp_a = re.sub(r"[0-9 ]", "", _JYUTPING.get_jyutping_text(a))
-    jp_b = re.sub(r"[0-9 ]", "", _JYUTPING.get_jyutping_text(b))
+    jp_a = _toneless_jp(src)
+    jp_b = _toneless_jp(dst)
     if not jp_a or not jp_b:
         return True
     return _levenshtein(jp_a, jp_b) <= 2
 
 
-def _edit_is_safe(src: str, dst: str, text: str) -> bool:
+def _edit_is_safe(src: str, dst: str, text: str, vocab_lower: set) -> bool:
     if not src or src == dst or src not in text:
         return False
     if not dst:  # deletion: only known fillers may be removed
@@ -195,27 +222,104 @@ def _edit_is_safe(src: str, dst: str, text: str) -> bool:
             return False  # single-char CJK replace-all is too blunt to trust
         if len(dst) > len(src) + 2:
             return False
+        if _LATIN_RUN_RE.findall(src) != _LATIN_RUN_RE.findall(dst):
+            return False  # embedded English changed — the phonetic guard only
+            # inspects CJK, so a mixed span could smuggle book→put past it
         if _t2s(src) == _t2s(dst):
             return False  # variant/script churn (個→箇), same word either way
         if not _phonetically_close(src, dst):
             return False
     else:
-        # Latin-only: longer targets allowed (misheard term → vocab phrase).
+        # Latin-only: the model may recover a misheard term ONLY toward a
+        # declared vocabulary word (Word→hot word). It may NOT invent Latin
+        # "corrections" (observed live: send→sent), so dst must be a known term.
+        if dst.lower() not in vocab_lower:
+            return False
         if len(src) < 3 or len(dst) > len(src) + 10:
             return False
     return True
 
 
-def apply_edits(text: str, edits: list) -> str:
+def apply_edits(text: str, edits: list, vocab: list = None) -> str:
     """Apply the LLM's correction edits, dropping any that fail the guards.
-    A hallucinated edit degrades to a no-op — output is never corrupted."""
+    A hallucinated edit degrades to a no-op — output is never corrupted.
+    vocab: declared terms the model may recover Latin words toward."""
+    vocab_lower = {str(v).strip().lower()
+                   for v in (vocab or []) if str(v).strip()}
     for edit in edits or []:
         src = str(edit.get("from", ""))
         dst = str(edit.get("to", ""))
-        if _edit_is_safe(src, dst, text):
+        if _edit_is_safe(src, dst, text, vocab_lower):
             text = text.replace(src, dst)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
+
+
+# ------------------------------------------------- phonetic hot-word recovery
+# SenseVoice has no model-level hot-word biasing, so a KNOWN term the ASR
+# mis-heard as a homophone (中影夾雜 for hot-word 中英夾雜) is recovered here,
+# deterministically and offline: slide a window the length of each hot-word,
+# compare toneless jyutping, and only substitute when it is essentially the
+# same pronunciation. Terms not phonetically near a hot-word are never touched.
+
+_LATIN_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9']*")
+_LATIN_FUZZ_MIN = 6  # shorter Latin terms are too collision-prone to fuzz
+
+
+def _recover_cjk_hotword(text: str, hotword: str) -> str:
+    hw_syl = [s for _, s in _toneless_syllables(hotword)]
+    if not hw_syl or any(s is None for s in hw_syl):
+        return text  # hot-word has non-pronounceable chars; skip phonetic match
+    length = len(hotword)
+    hw_jp = "".join(hw_syl)
+    syl = _toneless_syllables(text)
+    wrong = set()
+    for i in range(len(syl) - length + 1):
+        window = syl[i:i + length]
+        if any(s is None for _, s in window):
+            continue  # window includes non-CJK; not a like-for-like span
+        chars = "".join(c for c, _ in window)
+        if chars == hotword:
+            continue  # already correct
+        if _levenshtein("".join(s for _, s in window), hw_jp) <= 1:
+            wrong.add(chars)
+    for w in sorted(wrong, key=len, reverse=True):
+        text = text.replace(w, hotword)
+    return text
+
+
+def _recover_latin_hotword(text: str, hotword: str) -> str:
+    if len(hotword) < _LATIN_FUZZ_MIN:
+        return text
+    low = hotword.lower()
+
+    def sub(m):
+        tok = m.group(0)
+        t = tok.lower()
+        if (t != low and t[0] == low[0] and t[-1] == low[-1]
+                and _levenshtein(t, low) == 1):
+            return hotword
+        return tok
+
+    return _LATIN_TOKEN_RE.sub(sub, text)
+
+
+def apply_phonetic_hotwords(text: str, hotwords: list) -> str:
+    """Recover ASR homophone slips of known hot-words. CJK terms match by
+    toneless jyutping (edit-distance ≤1); single-token Latin terms recover a
+    one-character typo to canonical casing. Deterministic, no network."""
+    if not text or not text.strip() or not hotwords:
+        return text
+    for hw in hotwords:
+        hw = str(hw).strip()
+        if not hw:
+            continue
+        if _CJK_CHAR_RE.search(hw):
+            if not _CJK_CHAR_RE.sub("", hw).strip():  # pure CJK (no spaces/latin)
+                text = _recover_cjk_hotword(text, hw)
+        elif " " not in hw and re.fullmatch(r"[A-Za-z0-9']+", hw):
+            text = _recover_latin_hotword(text, hw)
+    return text
 
 
 # ---------------------------------------------------------------- vocabulary

@@ -7,7 +7,12 @@ Measures wall time from *recording stop* to *text output complete*:
   clipboard-only path, so no window focus is needed).
 
 Models are warmed (one throwaway run per configuration) before timing.
-SLO: p50 <= 1.3 s in the default configuration (sensevoice + LLM Clean).
+
+Budget: the default config always runs the LLM correction pass (the old
+disfluency fast-path was removed so ASR homophone slips actually get fixed),
+so it is LLM-bound at ~2.5-3 s — the deterministic ASR+hotword+quick_clean
+work is ~0.45 s (see the "raw (no LLM)" row, which is the sub-second path a
+user gets by toggling the LLM off). SLO below tracks the default (LLM-on).
 
 Usage: .venv/bin/python scripts/bench_latency.py [--runs 10] [--wav PATH]
 """
@@ -31,6 +36,7 @@ from whisperflow_local.llm import LLMClient, LLMUnavailable  # noqa: E402
 from whisperflow_local.textproc import (  # noqa: E402
     apply_dictionary,
     apply_edits,
+    apply_phonetic_hotwords,
     parse_voice_commands,
     quick_clean,
     vocab_terms,
@@ -38,7 +44,7 @@ from whisperflow_local.textproc import (  # noqa: E402
 
 DEFAULT_WAV = os.path.join(os.path.dirname(__file__), "..",
                            "tests", "fixtures", "yue_en_5s.wav")
-SLO_S = 1.3
+SLO_S = 3.0  # default is LLM-bound; 'raw (no LLM)' is the sub-second path
 
 
 def pipeline_once(audio, asr, cfg, llm, mode):
@@ -61,11 +67,12 @@ def pipeline_once(audio, asr, cfg, llm, mode):
     formatted = parsed.text
     if mode == "default":
         formatted = quick_clean(formatted, vocab=vocab, hk=hk)
+        formatted = apply_phonetic_hotwords(formatted, vocab)
         try:
             edits = llm.propose_edits(formatted, vocab=vocab)
-            formatted = apply_edits(formatted, edits)
+            formatted = apply_edits(formatted, edits, vocab=vocab)
         except LLMUnavailable:
-            pass  # quick_clean output already stands on its own
+            pass  # quick_clean + hotword output already stands on its own
     insert(formatted, copy_only=True)  # test sink: clipboard, no focus needed
     return time.perf_counter() - t0, formatted
 

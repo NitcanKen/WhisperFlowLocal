@@ -32,6 +32,7 @@ from .sounds import play
 from .textproc import (
     apply_dictionary,
     apply_edits,
+    apply_phonetic_hotwords,
     parse_vocab_entry,
     parse_voice_commands,
     pick_profile,
@@ -440,11 +441,13 @@ class WhisperFlowApp(rumps.App):
                 if profile == "Clean":
                     # Guarded edit list, not a rewrite: qwen3.5:4b corrupts
                     # Cantonese when asked to regenerate whole sentences.
-                    base = quick_clean(parsed.text,
-                                       vocab=self._vocab_list(), hk=hk)
-                    edits = self.llm.propose_edits(base,
-                                                   vocab=self._vocab_list())
-                    formatted = apply_edits(base, edits)
+                    vocab = self._vocab_list()
+                    base = quick_clean(parsed.text, vocab=vocab, hk=hk)
+                    # Deterministic hot-word recovery first (SenseVoice has no
+                    # model-level biasing), then the LLM for general homophones.
+                    base = apply_phonetic_hotwords(base, vocab)
+                    edits = self.llm.propose_edits(base, vocab=vocab)
+                    formatted = apply_edits(base, edits, vocab=vocab)
                     log("route", f"llm edits ({self.llm.model}): "
                                  f"{edits if edits else 'none'}")
                 else:
@@ -454,15 +457,19 @@ class WhisperFlowApp(rumps.App):
                         formatted = to_hk(formatted)
                     log("route", f"llm rewrite ({profile}, {self.llm.model})")
             except LLMUnavailable as exc:
-                formatted = quick_clean(parsed.text,
-                                        vocab=self._vocab_list(), hk=hk)
-                log("route", f"quick_clean fallback — {exc}")
+                formatted = apply_phonetic_hotwords(
+                    quick_clean(parsed.text, vocab=self._vocab_list(), hk=hk),
+                    self._vocab_list())
+                log("route", f"quick_clean + hotwords fallback — {exc}")
                 self.state_msg = tr("status_llm_off_raw", err=exc)
                 _notify(tr("notify_ollama_title"), str(exc))
         elif profile != "Raw" and parsed.text:
-            # LLM toggled off: deterministic cleanup so 繁體/spacing still apply.
-            formatted = quick_clean(parsed.text, vocab=self._vocab_list(), hk=hk)
-            log("route", "quick_clean (LLM disabled)")
+            # LLM toggled off: deterministic cleanup + hot-word recovery so
+            # 繁體/spacing and known-term homophones still get fixed offline.
+            formatted = apply_phonetic_hotwords(
+                quick_clean(parsed.text, vocab=self._vocab_list(), hk=hk),
+                self._vocab_list())
+            log("route", "quick_clean + hotwords (LLM disabled)")
 
         if not self.config.get("punctuation") and formatted:
             formatted = strip_punctuation(formatted)
