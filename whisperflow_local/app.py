@@ -1,0 +1,753 @@
+"""WhisperFlow-Local menu-bar application (rumps).
+
+All capture/ASR/LLM work runs on worker threads; the AppKit main thread only
+renders menu state via a 33 ms timer, so the UI never blocks. Display text is
+localized (en / zh-HK) via i18n.tr; internal keys stay English.
+"""
+import datetime
+import fcntl
+import json
+import os
+import queue
+import subprocess
+import threading
+import time
+
+import rumps
+
+from . import APP_NAME, launchagent, paths, permissions
+from .applog import log
+from .asr import ASREngine
+from .audio import Recorder, duration_seconds, save_wav
+from .config import Config
+from .frontmost import frontmost_app_name
+from .history import History
+from .hotkeys import HotkeyManager
+from .i18n import set_language, tr
+from .keycap import KeyCapturePanel, pretty_combo, pretty_key
+from .injector import copy_to_clipboard, delete_chars, insert, press_enter
+from .llm import AI_COMMANDS, LLMClient, LLMUnavailable, PROFILES
+from .overlay import WaveformOverlay
+from .sounds import play
+from .textproc import (
+    apply_dictionary,
+    needs_llm_cleanup,
+    parse_vocab_entry,
+    parse_voice_commands,
+    pick_profile,
+    quick_clean,
+    strip_punctuation,
+    to_hk,
+    vocab_terms,
+)
+
+LANG_CODES = ["auto", "yue", "en", "mixed"]
+PROFILE_NAMES = ["Raw"] + list(PROFILES.keys())
+UI_LANGS = [("auto", "Auto (跟隨系統)"), ("en", "English"), ("zh-HK", "廣東話 zh-HK")]
+LEVEL_BARS = "▁▂▃▄▅▆▇█"
+
+
+def _notify(title: str, message: str) -> None:
+    try:
+        rumps.notification(APP_NAME, title, message)
+    except Exception:
+        # Notifications need an app bundle; fall back to log output.
+        print(f"[{APP_NAME}] {title}: {message}")
+
+
+class WhisperFlowApp(rumps.App):
+    def __init__(self):
+        super().__init__("🎤", quit_button=None)
+        paths.ensure_dirs()
+        self._acquire_single_instance_lock()
+        self.config = Config()
+        set_language(self.config.get("ui_language"))
+        self.recorder = Recorder()
+        self.asr = ASREngine(self.config.get("asr_engine"))
+        self.history = History()
+        self.llm = LLMClient(
+            self.config.get("ollama_url"), self.config.get("ollama_model")
+        )
+
+        self.state = "loading"  # loading|idle|recording|transcribing|formatting|error
+        self.state_msg = tr("status_loading_model")
+        self._last_inserted = ""
+        self._last_insert_path = ""
+        self._last_formatted = ""
+        self._history_dirty = True
+        self._jobs = queue.Queue()
+        self.overlay = WaveformOverlay()
+        self.keycap = KeyCapturePanel()
+        self._capture_session = None
+        self._capture_kind = None
+        self._capture_deadline = 0.0
+        self._capture_flash_until = 0.0
+        self._shown_title = None
+        self._shown_status = None
+
+        self._build_menu()
+
+        self._worker = threading.Thread(target=self._work_loop, daemon=True)
+        self._worker.start()
+
+        if os.environ.get("WFL_SELFTEST"):
+            return  # construction-only check: skip model load, hotkeys, timers
+
+        if os.environ.get("WFL_NO_PRELOAD"):
+            # Test hook: skip eager model load (it loads lazily on first use).
+            self.state = "idle"
+            self.state_msg = tr("status_ready")
+        else:
+            self._loader = threading.Thread(target=self._preload, daemon=True)
+            self._loader.start()
+
+        self.hotkeys = HotkeyManager(
+            self.config.get("ptt_key"),
+            self.config.get("toggle_hotkey"),
+            on_ptt_down=self._begin_recording,
+            on_ptt_up=self._end_recording,
+            on_toggle=self._toggle_recording,
+        )
+        self.hotkeys.start()
+
+        # 30 fps: drives both the menu state and the smooth waveform HUD.
+        self._timer = rumps.Timer(self._refresh_ui, 0.033)
+        self._timer.start()
+
+        # Hide the Dock icon AFTER the status item exists. Setting the
+        # Accessory policy before run() prevents the NSStatusItem from ever
+        # being created on this macOS; switching post-launch is safe.
+        self._policy_timer = rumps.Timer(self._hide_dock_icon, 1.5)
+        self._policy_timer.start()
+
+        if not permissions.accessibility_trusted():
+            log("perm", "Accessibility NOT granted — auto-paste disabled, "
+                        "falling back to clipboard mode")
+            _notify(tr("notify_perm_title"), tr("notify_perm_body"))
+
+        if not self.config.get("onboarded"):
+            self._onboard_timer = rumps.Timer(self._run_onboarding_once, 1.0)
+            self._onboard_timer.start()
+
+    def _acquire_single_instance_lock(self):
+        self._lockfile = open(os.path.join(paths.APP_SUPPORT, "app.lock"), "w")
+        try:
+            fcntl.flock(self._lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print(f"{APP_NAME} is already running — exiting this copy.")
+            raise SystemExit(0)
+
+    # ------------------------------------------------------------ menu setup
+    def _build_menu(self):
+        self.item_status = rumps.MenuItem(tr("status_starting"))
+        self.item_status.set_callback(None)
+
+        self.item_toggle = rumps.MenuItem(tr("menu_toggle"),
+                                          callback=self._menu_toggle)
+
+        self.menu_profile = rumps.MenuItem(tr("menu_profile"))
+        self._profile_items = {}
+        for name in PROFILE_NAMES:
+            item = rumps.MenuItem(tr(f"profile_{name}"),
+                                  callback=self._set_profile)
+            item._profile_key = name
+            self._profile_items[name] = item
+            self.menu_profile.add(item)
+
+        self.menu_lang = rumps.MenuItem(tr("menu_language"))
+        self._lang_items = {}
+        for code in LANG_CODES:
+            item = rumps.MenuItem(tr(f"lang_{code}"),
+                                  callback=self._set_language)
+            item._lang_code = code
+            self._lang_items[code] = item
+            self.menu_lang.add(item)
+
+        self.menu_engine = rumps.MenuItem(tr("menu_engine"))
+        self._engine_items = {}
+        for code in ("sensevoice", "qwen3"):
+            item = rumps.MenuItem(tr(f"engine_{code}"),
+                                  callback=self._set_engine)
+            item._engine_code = code
+            self._engine_items[code] = item
+            self.menu_engine.add(item)
+
+        self.item_llm = rumps.MenuItem(tr("menu_llm"), callback=self._toggle_llm)
+
+        self.menu_ai = rumps.MenuItem(tr("menu_ai"))
+        self._cmd_items = {}
+        for cmd in AI_COMMANDS:
+            item = rumps.MenuItem(tr(f"cmd_{cmd}"), callback=self._ai_command)
+            item._cmd_key = cmd
+            self._cmd_items[cmd] = item
+            self.menu_ai.add(item)
+        self.menu_ai.add(rumps.separator)
+        self.menu_ai.add(rumps.MenuItem(tr("menu_ai_clipboard"),
+                                        callback=self._ai_on_clipboard))
+
+        self.menu_history = rumps.MenuItem(tr("menu_history"))
+        seed = rumps.MenuItem(tr("menu_history_empty"))
+        seed.set_callback(None)
+        self.menu_history.add(seed)
+
+        self.menu_settings = rumps.MenuItem(tr("menu_settings"))
+        self.menu_settings.add(rumps.MenuItem(tr("menu_set_ptt"),
+                                              callback=self._set_ptt))
+        self.menu_settings.add(rumps.MenuItem(tr("menu_set_toggle"),
+                                              callback=self._set_toggle_hotkey))
+        self.menu_vocab = rumps.MenuItem(tr("menu_vocab"))
+        seed = rumps.MenuItem("…")
+        seed.set_callback(None)
+        self.menu_vocab.add(seed)
+        self._vocab_dirty = True
+        self.menu_settings.add(self.menu_vocab)
+        self.menu_settings.add(rumps.MenuItem(tr("menu_edit_rules"),
+                                              callback=self._edit_app_rules))
+        self.menu_settings.add(rumps.MenuItem(tr("menu_set_model"),
+                                              callback=self._set_model))
+        self.item_copy_only = rumps.MenuItem(tr("menu_copy_only"),
+                                             callback=self._toggle_copy_only)
+        self.menu_settings.add(self.item_copy_only)
+        self.item_punct = rumps.MenuItem(tr("menu_punct"),
+                                         callback=self._toggle_punct)
+        self.menu_settings.add(self.item_punct)
+        self.item_sounds = rumps.MenuItem(tr("menu_sounds"),
+                                          callback=self._toggle_sounds)
+        self.menu_settings.add(self.item_sounds)
+        self.item_login = rumps.MenuItem(tr("menu_login"),
+                                         callback=self._toggle_login)
+        self.menu_settings.add(self.item_login)
+
+        self.menu_ui_lang = rumps.MenuItem(tr("menu_ui_lang"))
+        self._ui_lang_items = {}
+        for code, label in UI_LANGS:
+            item = rumps.MenuItem(label, callback=self._set_ui_lang)
+            item._ui_lang = code
+            self._ui_lang_items[code] = item
+            self.menu_ui_lang.add(item)
+        self.menu_settings.add(self.menu_ui_lang)
+
+        self.menu_settings.add(rumps.MenuItem(tr("menu_open_config"),
+                                              callback=self._open_config))
+
+        self.menu = [
+            self.item_status,
+            None,
+            self.item_toggle,
+            self.menu_profile,
+            self.menu_lang,
+            self.menu_engine,
+            self.item_llm,
+            self.menu_ai,
+            self.menu_history,
+            None,
+            self.menu_settings,
+            rumps.MenuItem(tr("menu_permissions"),
+                           callback=self._show_onboarding),
+            None,
+            rumps.MenuItem(tr("menu_quit"), callback=self._quit),
+        ]
+        self._sync_checkmarks()
+
+    def _sync_checkmarks(self):
+        profile = self.config.get("profile")
+        for name, item in self._profile_items.items():
+            item.state = 1 if name == profile else 0
+        lang = self.config.get("language")
+        for code, item in self._lang_items.items():
+            item.state = 1 if code == lang else 0
+        engine = self.config.get("asr_engine")
+        for code, item in self._engine_items.items():
+            item.state = 1 if code == engine else 0
+        ui_lang = self.config.get("ui_language")
+        for code, item in self._ui_lang_items.items():
+            item.state = 1 if code == ui_lang else 0
+        self.item_llm.state = 1 if self.config.get("llm_enabled") else 0
+        self.item_copy_only.state = 1 if self.config.get("copy_only") else 0
+        self.item_punct.state = 1 if self.config.get("punctuation") else 0
+        self.item_sounds.state = 1 if self.config.get("sounds") else 0
+        self.item_login.state = 1 if launchagent.is_enabled() else 0
+
+    def _hide_dock_icon(self, timer):
+        timer.stop()
+        try:
+            from AppKit import (
+                NSApplication,
+                NSApplicationActivationPolicyAccessory,
+            )
+            NSApplication.sharedApplication().setActivationPolicy_(
+                NSApplicationActivationPolicyAccessory
+            )
+            log("ui", "Dock icon hidden (accessory policy applied post-launch)")
+        except Exception as exc:
+            log("ui", f"policy switch skipped: {exc}")
+
+    # ------------------------------------------------------------ UI refresh
+    def _refresh_ui(self, _timer):
+        # Smooth HUD first — it wants every tick.
+        self.overlay.tick(self.state, self.recorder.level)
+        self._poll_capture()
+
+        if self.state == "recording":
+            bar = LEVEL_BARS[min(len(LEVEL_BARS) - 1,
+                                 int(self.recorder.level * len(LEVEL_BARS)))]
+            new_title = f"🔴{bar}"
+        else:
+            new_title = {
+                "loading": "⏳", "idle": "🎤", "transcribing": "✍️",
+                "formatting": "✨", "error": "⚠️",
+            }.get(self.state, "🎤")
+        # Only touch NSStatusItem/menu when something actually changed.
+        if new_title != self._shown_title:
+            self._shown_title = new_title
+            self.title = new_title
+        status = self.state_msg[:70]
+        if status != self._shown_status:
+            self._shown_status = status
+            self.item_status.title = status
+        if self._history_dirty:
+            self._history_dirty = False
+            self._rebuild_history_menu()
+        if self._vocab_dirty:
+            self._vocab_dirty = False
+            self._rebuild_vocab_menu()
+
+    def _rebuild_history_menu(self):
+        try:
+            self.menu_history.clear()
+        except AttributeError:
+            return  # submenu not materialized yet; retry on next dirty tick
+        entries = self.history.recent(10)
+        if not entries:
+            empty = rumps.MenuItem(tr("menu_history_empty"))
+            empty.set_callback(None)
+            self.menu_history.add(empty)
+        for e in entries:
+            ts = datetime.datetime.fromtimestamp(e["ts"]).strftime("%H:%M")
+            label = e["formatted"].replace("\n", " ")[:40] or "…"
+            item = rumps.MenuItem(f"{ts}  {label}", callback=self._reinsert)
+            item._entry_text = e["formatted"]
+            self.menu_history.add(item)
+        self.menu_history.add(rumps.separator)
+        self.menu_history.add(rumps.MenuItem(tr("menu_copy_last"),
+                                             callback=self._copy_last))
+        self.menu_history.add(rumps.MenuItem(tr("menu_clear_history"),
+                                             callback=self._clear_history))
+
+    # ------------------------------------------------------------ recording
+    def _begin_recording(self):
+        if self.state in ("recording",):
+            return
+        try:
+            self.recorder.start()
+            self.state = "recording"
+            self.state_msg = tr("status_recording")
+            play("start", self.config.get("sounds"))
+        except Exception as exc:
+            self.state = "error"
+            self.state_msg = f"{tr('notify_mic_title')}: {exc}"
+            play("error", self.config.get("sounds"))
+            _notify(tr("notify_mic_title"), tr("notify_mic_body"))
+
+    def _end_recording(self):
+        if self.state != "recording":
+            return
+        audio = self.recorder.stop()
+        play("stop", self.config.get("sounds"))
+        if duration_seconds(audio) < 0.3:
+            self.state = "idle"
+            self.state_msg = tr("status_too_short")
+            return
+        self.state = "transcribing"
+        self.state_msg = tr("status_transcribing")
+        self._jobs.put(("transcribe", audio))
+
+    def _toggle_recording(self):
+        if self.state == "recording":
+            self._end_recording()
+        else:
+            self._begin_recording()
+
+    def _menu_toggle(self, _):
+        self._toggle_recording()
+
+    # ------------------------------------------------------------ pipeline
+    def _preload(self):
+        try:
+            self.asr.ensure_loaded(
+                progress_cb=lambda m: setattr(self, "state_msg", m))
+            self.state = "idle"
+            self.state_msg = tr("status_ready")
+            log("model", "SenseVoiceSmall loaded; app ready")
+        except Exception as exc:
+            self.state = "error"
+            self.state_msg = f"{tr('notify_model_fail')}: {exc}"
+            log("model", f"load FAILED: {exc}")
+            _notify(tr("notify_model_fail"), str(exc))
+
+    def _work_loop(self):
+        while True:
+            kind, payload = self._jobs.get()
+            try:
+                if kind == "transcribe":
+                    self._process_audio(payload)
+                elif kind == "ai_command":
+                    self._process_ai_command(*payload)
+            except Exception as exc:
+                self.state = "error"
+                self.state_msg = f"{tr('notify_pipeline_err')}: {exc}"
+                play("error", self.config.get("sounds"))
+                _notify(tr("notify_pipeline_err"), str(exc))
+
+    def _process_audio(self, audio):
+        wav = save_wav(audio, paths.AUDIO_TMP)
+        log("audio", f"{duration_seconds(audio):.1f}s captured")
+        raw = self.asr.transcribe(wav, self.config.get("language"),
+                                  context=self._vocab_list())
+        log("asr", raw if raw.strip() else "(empty)")
+        if not raw.strip():
+            self.state = "idle"
+            self.state_msg = tr("status_heard_nothing")
+            return
+
+        text = apply_dictionary(raw, self.config.get("dictionary"))
+        parsed = parse_voice_commands(text)
+
+        if parsed.scratch:
+            if self._last_inserted and self._last_insert_path in ("paste", "type"):
+                delete_chars(len(self._last_inserted))
+                self.state_msg = tr("status_scratched")
+            else:
+                self.state_msg = tr("status_nothing_to_scratch")
+            self._last_inserted = ""
+            self.state = "idle"
+            return
+
+        app_name = frontmost_app_name()
+        profile = pick_profile(
+            app_name, self.config.get("app_rules"), self.config.get("profile")
+        )
+
+        formatted = parsed.text
+        hk = self.config.get("traditional_hk")
+        use_llm = (self.config.get("llm_enabled") and profile != "Raw"
+                   and parsed.text)
+        if use_llm and profile == "Clean" and not needs_llm_cleanup(parsed.text):
+            # Fast path: clean speech needs no LLM judgement — deterministic
+            # cleanup keeps end-to-end latency inside the 1.3 s budget.
+            formatted = quick_clean(parsed.text, vocab=self._vocab_list(), hk=hk)
+            log("route", "fast path (no disfluencies)")
+        elif use_llm:
+            self.state = "formatting"
+            self.state_msg = f"{tr('status_formatting')} ({profile})…"
+            try:
+                formatted = self.llm.format_text(parsed.text, profile,
+                                                 vocab=self._vocab_list())
+                if hk:
+                    formatted = to_hk(formatted)
+            except LLMUnavailable as exc:
+                formatted = quick_clean(parsed.text,
+                                        vocab=self._vocab_list(), hk=hk)
+                self.state_msg = tr("status_llm_off_raw", err=exc)
+                _notify(tr("notify_ollama_title"), str(exc))
+
+        if not self.config.get("punctuation") and formatted:
+            formatted = strip_punctuation(formatted)
+
+        if formatted:
+            path = insert(formatted, copy_only=self.config.get("copy_only"))
+            log("insert", f"path={path} text={formatted[:60]!r}")
+            if parsed.press_enter and path in ("paste", "type"):
+                press_enter()
+            self._last_inserted = formatted
+            self._last_insert_path = path
+            self._last_formatted = formatted
+            self.history.add(raw, formatted, app_name, profile)
+            self._history_dirty = True
+            shown = formatted.replace("\n", " ")[:48]
+            if path == "clipboard-no-perm":
+                self.state_msg = tr("status_copied_no_perm")
+                _notify(tr("notify_copied_title"), tr("notify_copied_body"))
+            else:
+                self.state_msg = f"{tr('status_inserted_via')} ({path}): {shown}"
+        play("done", self.config.get("sounds"))
+        if self.state != "error":
+            self.state = "idle"
+
+    def _process_ai_command(self, command, source_text):
+        self.state = "formatting"
+        self.state_msg = f"AI: {tr(f'cmd_{command}')}…"
+        try:
+            out = self.llm.run_command(command, source_text)
+        except LLMUnavailable as exc:
+            self.state = "error"
+            self.state_msg = str(exc)
+            play("error", self.config.get("sounds"))
+            _notify(tr("notify_ollama_title"), str(exc))
+            return
+        copy_to_clipboard(out)
+        self._last_formatted = out
+        self.history.add(source_text, out, frontmost_app_name(), f"AI:{command}")
+        self._history_dirty = True
+        self.state = "idle"
+        self.state_msg = f"{tr('status_ai_copied')} {out[:40]}"
+        play("done", self.config.get("sounds"))
+        _notify(tr(f"cmd_{command}"), out[:120])
+
+    # ------------------------------------------------------------ callbacks
+    def _set_profile(self, sender):
+        self.config.set("profile", sender._profile_key)
+        self._sync_checkmarks()
+
+    def _set_language(self, sender):
+        self.config.set("language", sender._lang_code)
+        self._sync_checkmarks()
+
+    def _set_engine(self, sender):
+        self.config.set("asr_engine", sender._engine_code)
+        self.asr.set_engine(sender._engine_code)
+        self._sync_checkmarks()
+        # Warm the newly selected engine off the main thread.
+        threading.Thread(target=self._preload, daemon=True).start()
+
+    def _set_ui_lang(self, sender):
+        self.config.set("ui_language", sender._ui_lang)
+        self._sync_checkmarks()
+        rumps.alert(APP_NAME, tr("dlg_restart_lang"))
+
+    def _toggle_llm(self, _):
+        self.config.set("llm_enabled", not self.config.get("llm_enabled"))
+        self._sync_checkmarks()
+
+    def _toggle_copy_only(self, _):
+        self.config.set("copy_only", not self.config.get("copy_only"))
+        self._sync_checkmarks()
+
+    def _toggle_punct(self, _):
+        self.config.set("punctuation", not self.config.get("punctuation"))
+        self._sync_checkmarks()
+
+    def _toggle_sounds(self, _):
+        self.config.set("sounds", not self.config.get("sounds"))
+        self._sync_checkmarks()
+
+    def _toggle_login(self, _):
+        launchagent.toggle()
+        self._sync_checkmarks()
+
+    def _ai_command(self, sender):
+        source = self._last_formatted
+        if not source:
+            rumps.alert(APP_NAME, tr("dlg_no_dictation"))
+            return
+        self._jobs.put(("ai_command", (sender._cmd_key, source)))
+
+    def _ai_on_clipboard(self, _):
+        import pyperclip
+        source = pyperclip.paste()
+        if not source.strip():
+            rumps.alert(APP_NAME, tr("dlg_clipboard_empty"))
+            return
+        names = {tr(f"cmd_{c}"): c for c in AI_COMMANDS}
+        names.update({c: c for c in AI_COMMANDS})  # accept English too
+        resp = rumps.Window(
+            tr("dlg_which_command") + " / ".join(tr(f"cmd_{c}") for c in AI_COMMANDS),
+            APP_NAME, default_text=list(names)[0], dimensions=(260, 24),
+        ).run()
+        if resp.clicked and resp.text.strip() in names:
+            self._jobs.put(("ai_command", (names[resp.text.strip()], source)))
+
+    def _reinsert(self, sender):
+        insert(sender._entry_text, copy_only=self.config.get("copy_only"))
+        self.state_msg = tr("status_reinserted")
+
+    def _copy_last(self, _):
+        entries = self.history.recent(1)
+        if entries:
+            copy_to_clipboard(entries[0]["formatted"])
+            self.state_msg = tr("status_copied_last")
+
+    def _clear_history(self, _):
+        self.history.clear()
+        self._history_dirty = True
+
+    # ------------------------------------------------------------ settings
+    def _set_ptt(self, _):
+        self._start_capture("ptt")
+
+    def _set_toggle_hotkey(self, _):
+        self._start_capture("toggle")
+
+    def _start_capture(self, kind: str):
+        """Open the capture HUD and arm the one-shot key recorder."""
+        self._capture_kind = kind
+        self._capture_session = self.hotkeys.begin_capture(kind)
+        self._capture_deadline = time.time() + 10.0
+        self._capture_flash_until = 0.0
+        title = tr("cap_title_ptt" if kind == "ptt" else "cap_title_toggle")
+        prompt = tr("cap_prompt" if kind == "ptt" else "cap_prompt_combo")
+        self.keycap.show(title, prompt)
+
+    def _poll_capture(self):
+        """Advance the capture flow; runs on the main thread (rumps timer)."""
+        if self._capture_flash_until:
+            if time.time() > self._capture_flash_until:
+                self._capture_flash_until = 0.0
+                self.keycap.hide()
+            return
+        session = self._capture_session
+        if session is None:
+            return
+        if session.state == "waiting":
+            if time.time() > self._capture_deadline:
+                self.hotkeys.cancel_capture()
+                self._capture_session = None
+                self.keycap.hide()
+            return
+        self._capture_session = None
+        if session.state == "cancelled":
+            self.keycap.hide()
+            return
+        result = session.result
+        if self._capture_kind == "ptt":
+            self.hotkeys.update(result, self.config.get("toggle_hotkey"))
+            self.config.set("ptt_key", result)
+            shown = pretty_key(result)
+        else:
+            self.hotkeys.update(self.config.get("ptt_key"), result)
+            self.config.set("toggle_hotkey", result)
+            shown = pretty_combo(result)
+        self.keycap.show_result(tr("cap_saved", key=shown))
+        self._capture_flash_until = time.time() + 1.2
+
+    # ------------------------------------------------------------ vocabulary
+    def _vocab_list(self) -> list:
+        return vocab_terms(self.config.get("dictionary"),
+                           self.config.get("hotwords"))
+
+    def _rebuild_vocab_menu(self):
+        try:
+            self.menu_vocab.clear()
+        except AttributeError:
+            return  # submenu not materialized yet; retry on next dirty tick
+        pairs = self.config.get("dictionary") or []
+        terms = self.config.get("hotwords") or []
+        if not pairs and not terms:
+            empty = rumps.MenuItem(tr("vocab_empty"))
+            empty.set_callback(None)
+            self.menu_vocab.add(empty)
+        for i, entry in enumerate(pairs):
+            item = rumps.MenuItem(f"{entry.get('from')} → {entry.get('to')}",
+                                  callback=self._vocab_delete)
+            item._vocab_ref = ("pair", i)
+            self.menu_vocab.add(item)
+        for i, term in enumerate(terms):
+            item = rumps.MenuItem(str(term), callback=self._vocab_delete)
+            item._vocab_ref = ("term", i)
+            self.menu_vocab.add(item)
+        self.menu_vocab.add(rumps.separator)
+        self.menu_vocab.add(rumps.MenuItem(tr("vocab_add"),
+                                           callback=self._vocab_add))
+
+    def _vocab_add(self, _):
+        resp = rumps.Window(
+            tr("dlg_vocab_prompt"), APP_NAME, default_text="",
+            dimensions=(320, 24),
+        ).run()
+        if not resp.clicked:
+            return
+        parsed = parse_vocab_entry(resp.text)
+        if parsed is None:
+            rumps.alert(APP_NAME, tr("dlg_vocab_invalid"))
+            return
+        if parsed[0] == "pair":
+            entries = list(self.config.get("dictionary") or [])
+            entries.append({"from": parsed[1], "to": parsed[2]})
+            self.config.set("dictionary", entries)
+        else:
+            terms = list(self.config.get("hotwords") or [])
+            if parsed[1] not in terms:
+                terms.append(parsed[1])
+            self.config.set("hotwords", terms)
+        self._vocab_dirty = True
+
+    def _vocab_delete(self, sender):
+        kind, idx = sender._vocab_ref
+        if not rumps.alert(APP_NAME, tr("dlg_vocab_delete", item=sender.title),
+                           ok=None, cancel=True):
+            return
+        key = "dictionary" if kind == "pair" else "hotwords"
+        entries = list(self.config.get(key) or [])
+        if 0 <= idx < len(entries):
+            entries.pop(idx)
+            self.config.set(key, entries)
+        self._vocab_dirty = True
+
+    def _edit_app_rules(self, _):
+        current = json.dumps(self.config.get("app_rules"),
+                             ensure_ascii=False, indent=2)
+        resp = rumps.Window(
+            tr("dlg_rules_prompt", names=", ".join(PROFILE_NAMES)),
+            APP_NAME, default_text=current, dimensions=(420, 220),
+        ).run()
+        if resp.clicked:
+            try:
+                data = json.loads(resp.text)
+                assert isinstance(data, dict)
+            except (json.JSONDecodeError, AssertionError):
+                rumps.alert(APP_NAME, tr("dlg_invalid_json_rules"))
+                return
+            self.config.set("app_rules", data)
+
+    def _set_model(self, _):
+        resp = rumps.Window(
+            tr("dlg_model_prompt"),
+            APP_NAME, default_text=self.config.get("ollama_model"),
+            dimensions=(260, 24),
+        ).run()
+        if resp.clicked and resp.text.strip():
+            self.config.set("ollama_model", resp.text.strip())
+            self.llm = LLMClient(self.config.get("ollama_url"),
+                                 self.config.get("ollama_model"))
+
+    def _open_config(self, _):
+        subprocess.run(["open", paths.APP_SUPPORT], check=False)
+
+    # ------------------------------------------------------------ onboarding
+    def _run_onboarding_once(self, timer):
+        timer.stop()
+        self._show_onboarding(None)
+        self.config.set("onboarded", True)
+
+    def _show_onboarding(self, _):
+        # Trigger the system prompts so this process appears in the
+        # permission lists, then show the live status.
+        permissions.prompt_accessibility()
+        permissions.request_input_monitoring()
+        s = permissions.summary()
+        mark = lambda ok: "✅" if ok else "❌"
+        body = tr("perm_summary", im=mark(s["input_monitoring"]),
+                  ax=mark(s["accessibility"]))
+        if not s["accessibility"]:
+            body += tr("perm_warning")
+        body += tr("onboard_body", ptt=self.config.get("ptt_key"),
+                   toggle=self.config.get("toggle_hotkey"))
+        rumps.alert(tr("onboard_title", app=APP_NAME), body)
+        for pane in ("Privacy_Microphone", "Privacy_Accessibility",
+                     "Privacy_ListenEvent"):
+            subprocess.run(
+                ["open", f"x-apple.systempreferences:com.apple.preference.security?{pane}"],
+                check=False,
+            )
+
+    def _quit(self, _):
+        self.hotkeys.stop()
+        rumps.quit_application()
+
+
+def main():
+    # NOTE: do NOT call setActivationPolicy_ before rumps runs — on this
+    # macOS it prevents the NSStatusItem from ever being created (verified
+    # empirically: 0 windows vs 8). Dock-icon suppression comes from the
+    # app bundle's LSUIElement instead, which spawned children inherit.
+    WhisperFlowApp().run()

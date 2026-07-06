@@ -1,0 +1,14 @@
+rumps>=0.4.0
+pynput>=1.7.6
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.24
+pyperclip>=1.8.2
+requests>=2.31.0
+torch>=2.1
+torchaudio>=2.1
+funasr>=1.1.4
+modelscope>=1.15.0
+qwen-asr>=0.0.6
+opencc-python-reimplemented>=0.1.7
+pytest>=8.0
