@@ -669,7 +669,11 @@ class WhisperFlowApp(rumps.App):
         self._capture_flash_until = 0.0
         title = tr("cap_title_ptt" if kind == "ptt" else "cap_title_toggle")
         prompt = tr("cap_prompt" if kind == "ptt" else "cap_prompt_combo")
-        self.keycap.show(title, prompt)
+        log("capture", f"begin kind={kind}")
+        try:
+            self.keycap.show(title, prompt)
+        except Exception as exc:
+            log("capture", f"panel show failed: {exc!r}")
 
     def _poll_capture(self):
         """Advance the capture flow; runs on the main thread (rumps timer)."""
@@ -683,6 +687,7 @@ class WhisperFlowApp(rumps.App):
             return
         if session.state == "waiting":
             if time.time() > self._capture_deadline:
+                log("capture", "deadline expired — no key captured")
                 self.hotkeys.cancel_capture()
                 self._capture_session = None
                 self.keycap.hide()
@@ -692,16 +697,23 @@ class WhisperFlowApp(rumps.App):
             self.keycap.hide()
             return
         result = session.result
-        if self._capture_kind == "ptt":
-            self.hotkeys.update(result, self.config.get("toggle_hotkey"))
-            self.config.set("ptt_key", result)
-            shown = pretty_key(result)
-        else:
-            self.hotkeys.update(self.config.get("ptt_key"), result)
-            self.config.set("toggle_hotkey", result)
-            shown = pretty_combo(result)
-        self.keycap.show_result(tr("cap_saved", key=shown))
+        # Apply the binding + show the "Saved" flash defensively: if any of this
+        # raises, the auto-hide MUST still arm below, or the capture panel stays
+        # on screen forever (the "pressed a key, no response" symptom).
+        try:
+            if self._capture_kind == "ptt":
+                self.hotkeys.update(result, self.config.get("toggle_hotkey"))
+                self.config.set("ptt_key", result)
+                shown = pretty_key(result)
+            else:
+                self.hotkeys.update(self.config.get("ptt_key"), result)
+                self.config.set("toggle_hotkey", result)
+                shown = pretty_combo(result)
+            self.keycap.show_result(tr("cap_saved", key=shown))
+        except Exception as exc:
+            log("capture", f"apply/show_result failed: {exc!r}")
         self._capture_flash_until = time.time() + 1.2
+        log("capture", f"applied {self._capture_kind}={result!r}")
 
     # ------------------------------------------------------------ vocabulary
     def _vocab_list(self) -> list:

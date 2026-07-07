@@ -59,3 +59,7 @@ tests/    # pytest; conftest isolates app.log from the real one
   ON (the binary's cdhash changed). The script resets stale grants; if paste or
   hotkeys die right after a rebuild, re-grant and restart. Don't work around it
   in code.
+- The .app runs a compiled `launcher.c` shim that execs the venv Python against
+  the **live repo**, so just relaunching picks up `.py` edits — no rebuild, no
+  cdhash change. Only run `make_app.sh` when `launcher.c`, `Info.plist`, or the
+  icon change; needlessly rebuilding is what triggers the TCC breakage above.
