@@ -70,7 +70,7 @@ SEPIA_STRANDS = 7
 GOLD_STRANDS = 3
 STRAND_COUNT = SEPIA_STRANDS + GOLD_STRANDS
 LEVEL_FLOOR = 0.05             # bundle stays gently alive in silence
-AMP_FRAC = 0.38                # max fan-out as a fraction of pill height
+AMP_FRAC = 0.4                 # max fan-out as a fraction of pill height
 TAPER_EXP = 0.6                # end-taper window sharpness
 
 # Perceptual response: raw mic levels sit low (~0.1–0.3) at normal speaking
@@ -78,7 +78,7 @@ TAPER_EXP = 0.6                # end-taper window sharpness
 # gain + gamma lifts conversational levels into a strong visual swing while
 # true silence (raw <= gate) stays converged.
 LEVEL_GATE = 0.04
-LEVEL_GAIN = 3.2
+LEVEL_GAIN = 3.6
 LEVEL_GAMMA = 0.55
 
 # Palette from the app icon (sRGB 0..1 triples).
