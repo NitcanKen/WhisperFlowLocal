@@ -48,6 +48,38 @@ S = {
         "Qwen3-ASR（更準 + 支援詞彙偏好）",
     ),
     "menu_llm": ("AI Cleanup (Ollama)", "AI 清理（Ollama）"),
+    "menu_model": ("AI Model", "AI 模型"),
+    "model_auto": (
+        "Qwen3.6-35B — remote (auto-fallback)",
+        "Qwen3.6-35B — 遠端（自動後備）",
+    ),
+    "model_local": ("qwen3.5:4b — local", "qwen3.5:4b — 本地"),
+    "model_fallback_tag": (" — ⚠︎ local fallback", " — ⚠︎ 本地後備"),
+    "status_llm_fallback": (
+        "Remote LLM unreachable — using local {model}.",
+        "遠端 LLM 未能連接 — 改用本地 {model}。",
+    ),
+    "status_llm_reconnected": (
+        "Reconnected to remote LLM ({model}).",
+        "已重新連接遠端 LLM（{model}）。",
+    ),
+    "notify_llm_fallback_title": (
+        "Switched to local AI model",
+        "已切換到本地 AI 模型",
+    ),
+    "notify_llm_fallback_body": (
+        "Remote unreachable after repeated tries — using local {model}. "
+        "Will retry the remote automatically.",
+        "遠端多次連接失敗 — 暫用本地 {model}，稍後會自動重試遠端。",
+    ),
+    "notify_llm_reconnect_title": (
+        "Back on remote AI model",
+        "已切換回遠端 AI 模型",
+    ),
+    "notify_llm_reconnect_body": (
+        "Remote LLM reachable again — using {model}.",
+        "遠端 LLM 恢復連接 — 使用 {model}。",
+    ),
     "menu_ai": ("AI Commands (last dictation)", "AI 指令（上次口述）"),
     "menu_ai_clipboard": ("Run on Clipboard Instead…", "改為處理剪貼簿內容…"),
     "menu_history": ("History", "歷史記錄"),

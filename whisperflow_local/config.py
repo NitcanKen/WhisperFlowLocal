@@ -18,6 +18,23 @@ DEFAULTS = {
     "llm_enabled": True,
     "ollama_url": "http://127.0.0.1:11434",
     "ollama_model": "qwen3.5:4b",
+    # LLM backend selection:
+    #   "auto"  = remote vLLM (OpenAI /v1) primary + local Ollama fallback +
+    #             circuit breaker (see router.py).
+    #   "local" = Ollama only; the remote is never contacted.
+    "llm_backend": "auto",
+    "vllm_url": "http://redacted-host:8000/v1",
+    "vllm_model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+    # Fall back to local if the remote can't connect within this many seconds,
+    # or sends no first token within the TTFT deadline (streaming). A generous
+    # total cap only guards a stream that dribbles forever.
+    "vllm_connect_timeout": 1.0,
+    "vllm_ttft_timeout": 1.0,
+    "vllm_total_timeout": 30.0,
+    # After this many consecutive fallbacks, pin to local; re-probe the remote
+    # after fallback_cooldown seconds (auto-retry).
+    "fallback_threshold": 3,
+    "fallback_cooldown": 300.0,
     # Default formatting profile: Raw | Clean | Email | Message | Notes
     "profile": "Clean",
     "copy_only": False,

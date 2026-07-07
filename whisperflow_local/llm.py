@@ -1,10 +1,21 @@
-"""Local LLM layer: qwen3.5 via the localhost Ollama API.
+"""LLM cleanup layer with two interchangeable backends.
 
-Qwen3-family models are hybrid reasoning models. Thinking is disabled with
-the API-level `think: false` flag (measured 60-180 s/utterance with thinking
-on — unusable for dictation); if the server/model rejects that flag the
-request is retried without it and any <think>...</think> block is stripped
-from the output defensively.
+Both backends share all prompt-building (`format_text`, `propose_edits`,
+`run_command`) in `BaseLLMBackend`; only the wire format differs:
+
+- `OllamaBackend` — the local Ollama `/api/chat` API (`qwen3.5:4b`). Kept as
+  `LLMClient` (an alias) for backward compatibility with existing callers/tests.
+- `VLLMBackend` — a remote vLLM OpenAI-compatible server (`/v1/chat/completions`,
+  e.g. `Qwen3.6-35B`). It **streams** the response and gives up if no first
+  token arrives within a short TTFT deadline, so an asleep/overloaded remote
+  fails over fast while a legitimately long generation is never cut off.
+
+`router.LLMRouter` composes the two (remote primary + local fallback + breaker).
+
+Qwen3-family models are hybrid reasoning models. Thinking is disabled — on
+Ollama via `think: false`, on vLLM via `chat_template_kwargs.enable_thinking`
+false — and any `<think>...</think>` block is stripped defensively (measured
+60-180 s/utterance with thinking on — unusable for dictation).
 
 The Clean profile does NOT rewrite the transcript with the LLM. Verified
 against real qwen3.5:4b output: full-sentence rewriting corrupts Cantonese
@@ -15,6 +26,7 @@ hallucinated edit degrades to a no-op instead of corrupted text.
 """
 import json
 import re
+import time
 
 import requests
 
@@ -123,14 +135,83 @@ def parse_edits(raw: str) -> list:
 
 
 class LLMUnavailable(Exception):
-    """Raised when Ollama cannot be reached or the model is missing."""
+    """Raised when a backend cannot be reached, times out, or the model is
+    missing. The router treats this as 'this backend failed, try the next'."""
 
 
-class LLMClient:
+class BaseLLMBackend:
+    """Prompt-building shared by every backend. Subclasses implement only the
+    wire format via `_chat` (and `ping`)."""
+
     def __init__(self, base_url: str, model: str, timeout: float = 120.0):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
+
+    # --- wire format (backend-specific) ------------------------------------
+    def _chat(self, system: str, user: str, force_json: bool = False) -> str:
+        raise NotImplementedError
+
+    def ping(self) -> bool:
+        raise NotImplementedError
+
+    # --- prompt building (shared) ------------------------------------------
+    def format_text(self, text: str, profile: str, vocab: list = None) -> str:
+        """Apply a formatting profile. Raw or unknown profiles pass through.
+
+        vocab: user's preferred terms/spellings — soft bias so the model
+        keeps names like 'WhisperFlow' in their canonical form."""
+        system = PROFILES.get(profile)
+        if not system or not text.strip():
+            return text
+        if vocab:
+            system += (
+                " The user's preferred vocabulary (when the dictation refers "
+                "to one of these, use this exact spelling): "
+                + ", ".join(vocab) + "."
+            )
+        out = self._chat(system, text)
+        return out if out else text
+
+    def propose_edits(self, text: str, vocab: list = None) -> list:
+        """Ask the model for ASR-error corrections as an edit list.
+
+        Returns [{"from","to"}, ...]; the caller applies them through
+        textproc.apply_edits so unsafe edits are dropped. Raises
+        LLMUnavailable when the backend is down (same contract as format_text)."""
+        if not text.strip():
+            return []
+        system = EDIT_SYSTEM
+        if vocab:
+            system += (
+                "\n\n用戶常用詞（如果原文有片段係呢啲詞嘅近音誤寫，"
+                "改返做呢個寫法）：" + "、".join(vocab)
+            )
+        # Phonetic hint: give the model each character's Cantonese reading so it
+        # judges homophones by sound, not by guessing (phonetic-guided
+        # correction beats blind rewrite). Defensive import so a missing
+        # ToJyutping never breaks the correction path.
+        user = text
+        try:
+            from .textproc import jyutping_hint
+            hint = jyutping_hint(text)
+            if hint:
+                user = f"{text}\n\n（每個字嘅粵拼讀音，供你判斷同音字用）：{hint}"
+        except Exception:
+            pass
+        return parse_edits(self._chat(system, user, force_json=True))
+
+    def run_command(self, command: str, text: str) -> str:
+        system = AI_COMMANDS.get(command)
+        if not system:
+            raise ValueError(f"Unknown AI command: {command}")
+        return self._chat(system, text)
+
+
+class OllamaBackend(BaseLLMBackend):
+    """Local Ollama `/api/chat` (non-streaming). `think: false` disables Qwen3
+    reasoning; if the server rejects that flag we retry without it and strip
+    any <think> block defensively."""
 
     def _chat(self, system: str, user: str, force_json: bool = False) -> str:
         payload = {
@@ -170,60 +251,109 @@ class LLMClient:
         content = THINK_RE.sub("", content)
         return content.strip().strip('"').strip()
 
-    def format_text(self, text: str, profile: str, vocab: list = None) -> str:
-        """Apply a formatting profile. Raw or unknown profiles pass through.
-
-        vocab: user's preferred terms/spellings — soft bias so the model
-        keeps names like 'WhisperFlow' in their canonical form."""
-        system = PROFILES.get(profile)
-        if not system or not text.strip():
-            return text
-        if vocab:
-            system += (
-                " The user's preferred vocabulary (when the dictation refers "
-                "to one of these, use this exact spelling): "
-                + ", ".join(vocab) + "."
-            )
-        out = self._chat(system, text)
-        return out if out else text
-
-    def propose_edits(self, text: str, vocab: list = None) -> list:
-        """Ask the model for ASR-error corrections as an edit list.
-
-        Returns [{"from","to"}, ...]; the caller applies them through
-        textproc.apply_edits so unsafe edits are dropped. Raises
-        LLMUnavailable when Ollama is down (same contract as format_text)."""
-        if not text.strip():
-            return []
-        system = EDIT_SYSTEM
-        if vocab:
-            system += (
-                "\n\n用戶常用詞（如果原文有片段係呢啲詞嘅近音誤寫，"
-                "改返做呢個寫法）：" + "、".join(vocab)
-            )
-        # Phonetic hint: give the model each character's Cantonese reading so it
-        # judges homophones by sound, not by guessing (phonetic-guided
-        # correction beats blind rewrite). Defensive import so a missing
-        # ToJyutping never breaks the correction path.
-        user = text
-        try:
-            from .textproc import jyutping_hint
-            hint = jyutping_hint(text)
-            if hint:
-                user = f"{text}\n\n（每個字嘅粵拼讀音，供你判斷同音字用）：{hint}"
-        except Exception:
-            pass
-        return parse_edits(self._chat(system, user, force_json=True))
-
-    def run_command(self, command: str, text: str) -> str:
-        system = AI_COMMANDS.get(command)
-        if not system:
-            raise ValueError(f"Unknown AI command: {command}")
-        return self._chat(system, text)
-
     def ping(self) -> bool:
         try:
             requests.get(f"{self.base_url}/api/version", timeout=3).raise_for_status()
+            return True
+        except requests.RequestException:
+            return False
+
+
+# Backward-compatible alias: the local Ollama client used to be the only one.
+LLMClient = OllamaBackend
+
+
+class VLLMBackend(BaseLLMBackend):
+    """Remote vLLM OpenAI-compatible `/v1/chat/completions`, streamed.
+
+    The request uses `timeout=(connect_timeout, ttft_timeout)`: the connect
+    timeout catches an unreachable/asleep host; the read timeout is the
+    time-to-first-token deadline — if the server sends no first byte within it
+    (down / crashed / queued), requests raises and we surface LLMUnavailable so
+    the router falls back. Once tokens flow, `total_timeout` is a wall-clock
+    safety cap on a stream that never ends. Thinking is disabled via the vLLM
+    chat-template kwarg and stripped defensively.
+    """
+
+    def __init__(self, base_url: str, model: str,
+                 connect_timeout: float = 1.0, ttft_timeout: float = 1.0,
+                 total_timeout: float = 30.0, clock=time.monotonic):
+        super().__init__(base_url, model, timeout=total_timeout)
+        self.connect_timeout = connect_timeout
+        self.ttft_timeout = ttft_timeout
+        self.total_timeout = total_timeout
+        self._clock = clock
+
+    def _read_stream(self, resp) -> str:
+        """Accumulate `choices[0].delta.content` from an SSE stream until
+        [DONE]. Enforces the wall-clock total cap; ignores malformed lines."""
+        start = self._clock()
+        parts = []
+        try:
+            for line in resp.iter_lines(decode_unicode=True):
+                if self._clock() - start > self.total_timeout:
+                    raise LLMUnavailable(
+                        f"vLLM stream exceeded {self.total_timeout}s cap"
+                    )
+                if not line:
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                piece = (choices[0].get("delta") or {}).get("content")
+                if piece:
+                    parts.append(piece)
+        finally:
+            resp.close()
+        return "".join(parts)
+
+    def _chat(self, system: str, user: str, force_json: bool = False) -> str:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "stream": True,
+            "temperature": 0 if force_json else 0.2,
+            # Disable Qwen3 thinking for the vLLM chat template.
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        if force_json:
+            payload["response_format"] = {"type": "json_object"}
+        try:
+            resp = requests.post(
+                f"{self.base_url}/chat/completions",
+                json=payload, stream=True,
+                timeout=(self.connect_timeout, self.ttft_timeout),
+            )
+            if resp.status_code != 200:
+                resp.close()
+                raise LLMUnavailable(
+                    f"vLLM HTTP {resp.status_code} at {self.base_url}"
+                )
+            content = self._read_stream(resp)
+        except requests.RequestException as exc:
+            raise LLMUnavailable(
+                f"vLLM unreachable/slow at {self.base_url}: {exc.__class__.__name__}"
+            ) from exc
+        content = THINK_RE.sub("", content)
+        return content.strip().strip('"').strip()
+
+    def ping(self) -> bool:
+        try:
+            requests.get(
+                f"{self.base_url}/models", timeout=self.connect_timeout + 2
+            ).raise_for_status()
             return True
         except requests.RequestException:
             return False

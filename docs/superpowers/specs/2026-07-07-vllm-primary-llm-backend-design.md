@@ -201,6 +201,10 @@ menu only toggles `llm_backend`.
 - `whisperflow_local/config.py` — new DEFAULTS keys (§7).
 - `whisperflow_local/app.py` — build `LLMRouter`; "AI Model" radio submenu;
   wire breaker notices + menu-state updates; `set_model` → `set_local_model`.
+- `whisperflow_local/i18n.py` — strings for the "AI Model" submenu and the
+  fallback/reconnect notices (en + zh-HK).
+- `whisperflow_local/__main__.py` — `--selftest` recurses one level so submenu
+  entries (the "AI Model" children) are printed for verification.
 - `tests/test_llm_router.py`, `tests/test_vllm_backend.py` — new.
 - `scripts/itest_vllm_live.py` — new.
 - `SPEC.md` (§1 tech stack, §C LLM) + `CLAUDE.md` — one-line note that the LLM

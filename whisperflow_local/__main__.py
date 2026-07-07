@@ -19,6 +19,12 @@ def selftest() -> int:
     print("menu items:")
     for key in app.menu.keys():
         print(f"  - {key}")
+        try:
+            subkeys = list(app.menu[key].keys())
+        except Exception:
+            subkeys = []
+        for sk in subkeys:
+            print(f"      · {sk}")
     print("selftest OK: rumps app constructed with full menu")
     return 0
 

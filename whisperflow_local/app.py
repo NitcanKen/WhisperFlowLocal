@@ -26,8 +26,9 @@ from .hotkeys import HotkeyManager
 from .i18n import set_language, tr
 from .keycap import KeyCapturePanel, pretty_combo, pretty_key
 from .injector import copy_to_clipboard, delete_chars, insert, press_enter
-from .llm import AI_COMMANDS, LLMClient, LLMUnavailable, PROFILES
+from .llm import AI_COMMANDS, LLMUnavailable, OllamaBackend, PROFILES, VLLMBackend
 from .overlay import WaveformOverlay
+from .router import LLMRouter
 from .sounds import play
 from .textproc import (
     apply_dictionary,
@@ -61,15 +62,16 @@ class WhisperFlowApp(rumps.App):
     def __init__(self):
         super().__init__("🎤", quit_button=None)
         paths.ensure_dirs()
-        self._acquire_single_instance_lock()
+        if not os.environ.get("WFL_SELFTEST"):
+            # --selftest only builds the menu and exits; it must not clash with
+            # an already-running app instance over the single-instance lock.
+            self._acquire_single_instance_lock()
         self.config = Config()
         set_language(self.config.get("ui_language"))
         self.recorder = Recorder()
         self.asr = ASREngine(self.config.get("asr_engine"))
         self.history = History()
-        self.llm = LLMClient(
-            self.config.get("ollama_url"), self.config.get("ollama_model")
-        )
+        self.llm = self._build_router()
 
         self.state = "loading"  # loading|idle|recording|transcribing|formatting|error
         self.state_msg = tr("status_loading_model")
@@ -77,6 +79,10 @@ class WhisperFlowApp(rumps.App):
         self._last_insert_path = ""
         self._last_formatted = ""
         self._history_dirty = True
+        # Set by the LLMRouter notify callback (worker thread); the main-thread
+        # UI timer picks it up and shows the fallback/reconnect notice.
+        self._llm_switch_dirty = False
+        self._llm_switch_note = None
         self._jobs = queue.Queue()
         self.overlay = WaveformOverlay()
         self.keycap = KeyCapturePanel()
@@ -176,6 +182,14 @@ class WhisperFlowApp(rumps.App):
 
         self.item_llm = rumps.MenuItem(tr("menu_llm"), callback=self._toggle_llm)
 
+        self.menu_model = rumps.MenuItem(tr("menu_model"))
+        self._backend_items = {}
+        for code in ("auto", "local"):
+            item = rumps.MenuItem(tr(f"model_{code}"), callback=self._set_backend)
+            item._backend_code = code
+            self._backend_items[code] = item
+            self.menu_model.add(item)
+
         self.menu_ai = rumps.MenuItem(tr("menu_ai"))
         self._cmd_items = {}
         for cmd in AI_COMMANDS:
@@ -240,6 +254,7 @@ class WhisperFlowApp(rumps.App):
             self.menu_lang,
             self.menu_engine,
             self.item_llm,
+            self.menu_model,
             self.menu_ai,
             self.menu_history,
             None,
@@ -265,6 +280,9 @@ class WhisperFlowApp(rumps.App):
         for code, item in self._ui_lang_items.items():
             item.state = 1 if code == ui_lang else 0
         self.item_llm.state = 1 if self.config.get("llm_enabled") else 0
+        backend = self.config.get("llm_backend")
+        for code, item in self._backend_items.items():
+            item.state = 1 if code == backend else 0
         self.item_copy_only.state = 1 if self.config.get("copy_only") else 0
         self.item_punct.state = 1 if self.config.get("punctuation") else 0
         self.item_sounds.state = 1 if self.config.get("sounds") else 0
@@ -313,6 +331,9 @@ class WhisperFlowApp(rumps.App):
         if self._vocab_dirty:
             self._vocab_dirty = False
             self._rebuild_vocab_menu()
+        if self._llm_switch_dirty:
+            self._llm_switch_dirty = False
+            self._apply_llm_switch(*self._llm_switch_note)
 
     def _rebuild_history_menu(self):
         try:
@@ -530,6 +551,48 @@ class WhisperFlowApp(rumps.App):
         # Warm the newly selected engine off the main thread.
         threading.Thread(target=self._preload, daemon=True).start()
 
+    def _build_router(self):
+        c = self.config
+        local = OllamaBackend(c.get("ollama_url"), c.get("ollama_model"))
+        remote = VLLMBackend(
+            c.get("vllm_url"), c.get("vllm_model"),
+            connect_timeout=c.get("vllm_connect_timeout"),
+            ttft_timeout=c.get("vllm_ttft_timeout"),
+            total_timeout=c.get("vllm_total_timeout"),
+        )
+        return LLMRouter(
+            local=local, remote=remote,
+            backend=c.get("llm_backend"),
+            threshold=c.get("fallback_threshold"),
+            cooldown=c.get("fallback_cooldown"),
+            notify=self._on_llm_switch,
+        )
+
+    def _set_backend(self, sender):
+        self.config.set("llm_backend", sender._backend_code)
+        self.llm.set_backend(sender._backend_code)
+        if sender._backend_code == "local":
+            self.menu_model.title = tr("menu_model")  # clear any fallback tag
+        self._sync_checkmarks()
+
+    def _on_llm_switch(self, event, model):
+        """LLMRouter callback (worker thread) — defer all UI to the timer."""
+        self._llm_switch_note = (event, model)
+        self._llm_switch_dirty = True
+
+    def _apply_llm_switch(self, event, model):
+        """Main-thread: reflect a breaker trip / reconnect in menu + notice."""
+        if event == "fallback":
+            self.menu_model.title = tr("menu_model") + tr("model_fallback_tag")
+            self.state_msg = tr("status_llm_fallback", model=model)
+            _notify(tr("notify_llm_fallback_title"),
+                    tr("notify_llm_fallback_body", model=model))
+        else:  # reconnected
+            self.menu_model.title = tr("menu_model")
+            self.state_msg = tr("status_llm_reconnected", model=model)
+            _notify(tr("notify_llm_reconnect_title"),
+                    tr("notify_llm_reconnect_body", model=model))
+
     def _set_ui_lang(self, sender):
         self.config.set("ui_language", sender._ui_lang)
         self._sync_checkmarks()
@@ -727,8 +790,7 @@ class WhisperFlowApp(rumps.App):
         ).run()
         if resp.clicked and resp.text.strip():
             self.config.set("ollama_model", resp.text.strip())
-            self.llm = LLMClient(self.config.get("ollama_url"),
-                                 self.config.get("ollama_model"))
+            self.llm.set_local_model(resp.text.strip())
 
     def _open_config(self, _):
         subprocess.run(["open", paths.APP_SUPPORT], check=False)

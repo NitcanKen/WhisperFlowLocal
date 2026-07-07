@@ -1,8 +1,9 @@
 # WhisperFlow-Local
 
 100% local, offline Cantonese-English dictation menu-bar app for macOS (Apple
-Silicon). Hold a key → record → SenseVoiceSmall ASR → local Ollama LLM cleanup →
-paste into the focused app. Python 3.11, `rumps` menu bar. `SPEC.md` is the
+Silicon). Hold a key → record → SenseVoiceSmall ASR → LLM cleanup (remote vLLM
+primary, local Ollama fallback) → paste into the focused app. Python 3.11,
+`rumps` menu bar. `SPEC.md` is the
 source of truth (acceptance criteria A1–J4) — read it before adding features.
 
 ## Commands
@@ -21,7 +22,8 @@ scripts/make_app.sh                               # build ~/Applications/Whisper
 whisperflow_local/
   app.py        # rumps menu-bar app + record→ASR→LLM→inject pipeline (run via __main__)
   asr.py        # SenseVoiceSmall (funasr); optional qwen3 engine, falls back to sensevoice
-  llm.py        # Ollama cleanup + edit-list prompts (think:false)
+  llm.py        # LLM backends: OllamaBackend (local) + VLLMBackend (remote, streaming/TTFT); edit-list prompts, thinking off
+  router.py     # LLMRouter: remote-primary + local fallback + 3-strike breaker + cooldown retry
   textproc.py   # voice commands, custom dictionary, punctuation, OpenCC s2hk
   hotkeys.py keycap.py  # global push-to-talk + toggle hotkeys (pynput)
   injector.py   # clipboard + synthesized ⌘V paste, then restore prior clipboard
@@ -38,8 +40,9 @@ tests/    # pytest; conftest isolates app.log from the real one
   model. `grep -riE "mock|fake|dummy|stub|placeholder|hardcode|lorem|TODO"` over
   source must stay clean. Tests and `e2e.py` exercise the real ASR/LLM (or real
   error paths), never fakes.
-- IMPORTANT: Keep Qwen thinking mode off — pass `think: false` to Ollama. Enabling
-  it adds 60–180 s/utterance and leaks `<think>` blocks into the output.
+- IMPORTANT: Keep Qwen thinking mode off — `think: false` on Ollama,
+  `chat_template_kwargs.enable_thinking: false` on vLLM. Enabling it adds
+  60–180 s/utterance and leaks `<think>` blocks into the output.
 - Clean profile uses guarded edit-list prompts (see `llm.py`), not full-sentence
   rewriting — rewriting corrupts Cantonese and code-switching. Don't collapse it
   back into a rewrite prompt.

@@ -24,6 +24,12 @@ of truth. "Done" = every acceptance criterion below is implemented for real and 
 - **LLM = `qwen3.5:4b` via Ollama** (already installed), local API. Qwen3 is a hybrid reasoning
   model → **thinking mode MUST be disabled** (`think:false` / append `/no_think`) so it returns
   only the corrected text, no `<think>` blocks.
+- **LLM backends (as of 2026-07-07):** the cleanup layer is now dual-backend — a remote vLLM
+  server (`Qwen3.6-35B`, OpenAI `/v1`, streaming with a ~1 s time-to-first-token fallback) is
+  primary, with the local Ollama `qwen3.5:4b` as automatic fallback and a 3-strike circuit
+  breaker + cooldown auto-retry. `router.LLMRouter` composes them; menu → AI Model pins local.
+  See `docs/superpowers/specs/2026-07-07-vllm-primary-llm-backend-design.md`. Thinking stays off
+  on both.
 - Clipboard via **`pyperclip`**. History via **SQLite** (stdlib `sqlite3`).
 - Config as JSON under `~/Library/Application Support/WhisperFlow-Local/`.
 
