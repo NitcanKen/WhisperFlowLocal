@@ -227,3 +227,46 @@ menu only toggles `llm_backend`.
   Clean still uses the guarded edit-list; vocab + jyutping hint still applied.
 - **AC8** `pytest` fully green; no-mocks grep over `whisperflow_local/` clean;
   UI never freezes (all LLM work off the main thread).
+
+## 13. Execution mode (for the autonomous run)
+
+- **Grounding first.** Before editing, actually read `whisperflow_local/llm.py`,
+  `app.py` (`_build_menu`, `_process_audio`, `_ai_command`, `_set_model`, and the
+  LLM construction near line 70), `config.py`, and the existing tests
+  (`tests/test_vocab.py`, `tests/test_llm_degradation.py`, `tests/conftest.py`).
+  Run commands; do not infer file contents.
+- **Thinking depth.** Think hard before implementing `VLLMBackend` streaming/TTFT
+  and the `LLMRouter` breaker — those are the non-trivial parts. Routine wiring
+  needs no extra reasoning.
+- **No plan mode.** This design is already approved; implement directly. (Plan
+  mode would pause the `/goal` loop waiting for approval.)
+- **Subagents.** The core (`llm.py` → `router.py` → `app.py`) is interdependent —
+  implement it directly and sequentially with shared context. Fan out subagents in
+  a single turn only for genuinely independent artifacts (e.g. authoring the two
+  new test files or the live script) after the interfaces are fixed. Do not
+  over-spawn.
+- **Completeness (anti-laziness).** Implement the entire §11 scope and all AC1–AC8.
+  Do not finish ~80% and list the remainder as TODO/gaps as if that were delivery.
+  Stop early only on a genuine blocker.
+- **Conventions.** Follow `CLAUDE.md`: no mocks in product code, thinking off,
+  guarded edit-list for Clean, all LLM work off the AppKit main thread.
+
+## 14. Verification & stopping rules
+
+Every completion claim needs fresh verification surfaced in the transcript. Run
+and paste:
+- `.venv/bin/python -m pytest tests/` → all pass (exit 0), including new
+  `test_llm_router.py` and `test_vllm_backend.py`.
+- `grep -rniE "mock|fake|dummy|stub|placeholder|hardcode|lorem|TODO" whisperflow_local/`
+  → no meaningful hits.
+- `.venv/bin/python -m whisperflow_local --selftest` → menu tree includes the
+  "AI Model" submenu (Remote 35B / Local 4B).
+- `.venv/bin/python scripts/itest_vllm_live.py` → real 35B output via
+  `VLLMBackend` (AC1/AC3) **and** a bad-`vllm_url` run showing real fallback to the
+  local 4B (AC2). If the remote is unreachable in this environment, print that
+  explicitly and still demonstrate the fallback path — never fabricate output.
+- Any failing build/test/grep/selftest ⇒ do not claim completion; list the failing
+  command, error summary, what was fixed, and what remains.
+- **Blocker rule.** If the same external blocker (remote unreachable, missing
+  Ollama model, dependency) recurs 3×, stop autonomous changes and output a
+  blocker report: steps tried, evidence, remaining risk, next-step options.
