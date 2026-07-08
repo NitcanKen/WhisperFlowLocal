@@ -30,16 +30,24 @@ def test_form_data_omits_language_for_auto():
     assert "prompt" not in data
 
 
-def test_form_data_maps_language_and_hotword_prompt():
+def test_form_data_english_iso_code_and_hotword_prompt():
+    # The remote endpoint uses Whisper ISO codes (NOT Qwen's "English").
     b = RemoteQwenASRBackend("http://x/v1", "m")
-    data = b._form_data("yue", ["WhisperFlow", "中英夾雜"])
-    assert data["language"] == "Cantonese"          # QWEN_LANGUAGE_MAP
+    data = b._form_data("en", ["WhisperFlow", "中英夾雜"])
+    assert data["language"] == "en"                 # VLLM_ASR_LANGUAGE_MAP
     assert data["prompt"] == "WhisperFlow, 中英夾雜"  # native decode-time biasing
 
 
-def test_form_data_english_and_blank_context():
+def test_form_data_cantonese_and_mixed_auto_detect():
+    # No distinct Cantonese ISO code; forcing "zh" drifts to Mandarin, so
+    # yue/mixed omit the field and let the model auto-detect (best Cantonese).
     b = RemoteQwenASRBackend("http://x/v1", "m")
-    assert b._form_data("en", ["", "  "])["language"] == "English"
+    for mode in ("yue", "mixed"):
+        assert "language" not in b._form_data(mode, None)
+
+
+def test_form_data_blank_context_no_prompt():
+    b = RemoteQwenASRBackend("http://x/v1", "m")
     assert "prompt" not in b._form_data("en", ["", "  "])  # nothing real to bias
 
 

@@ -33,12 +33,26 @@ LANGUAGE_MAP = {
 }
 
 # SPEC language modes -> Qwen3-ASR language names (None = auto-detect;
-# Qwen3-ASR code-switches natively, so Mixed also maps to auto).
+# Qwen3-ASR code-switches natively, so Mixed also maps to auto). Used by the
+# LOCAL on-device Qwen3ASREngine (the qwen_asr package wants full names).
 QWEN_LANGUAGE_MAP = {
     "auto": None,
     "mixed": None,
     "yue": "Cantonese",
     "en": "English",
+}
+
+# SPEC language modes -> the REMOTE vLLM `/v1/audio/transcriptions` `language`
+# field, which is Whisper-style ISO codes (NOT Qwen's full names) — the endpoint
+# rejects "Cantonese" outright. There is no distinct Cantonese code, and forcing
+# "zh" drifts the output toward Mandarin (食飯 -> 吃饭), whereas auto-detect yields
+# the cleanest Cantonese + code-switching (verified live). So only English is
+# forced; auto/mixed/yue omit the field and let the model auto-detect.
+VLLM_ASR_LANGUAGE_MAP = {
+    "auto": None,
+    "mixed": None,
+    "yue": None,
+    "en": "en",
 }
 
 ENGINES = ("sensevoice", "qwen3")
@@ -185,7 +199,7 @@ class RemoteQwenASRBackend:
         into `prompt` for native decode-time biasing; language maps via
         QWEN_LANGUAGE_MAP (auto/mixed omit the field for auto-detect)."""
         data = {"model": self.model, "response_format": "json"}
-        lang = QWEN_LANGUAGE_MAP.get(language)
+        lang = VLLM_ASR_LANGUAGE_MAP.get(language)
         if lang:
             data["language"] = lang
         if context:
