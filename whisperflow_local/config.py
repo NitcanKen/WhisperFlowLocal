@@ -12,9 +12,18 @@ DEFAULTS = {
     "toggle_hotkey": "<cmd>+<shift>+d",
     # ASR language mode: auto | yue | en | mixed
     "language": "auto",
-    # ASR engine: sensevoice (fast, light) | qwen3 (more accurate Cantonese,
-    # native hotword/context biasing; falls back to sensevoice on failure)
+    # ASR engine selection (mirrors llm_backend):
+    #   "qwen3"      = remote Qwen3-ASR (vLLM /v1/audio/transcriptions) primary +
+    #                  local SenseVoice fallback + circuit breaker (see asr_router.py).
+    #   "sensevoice" = SenseVoice only; the remote is never contacted.
     "asr_engine": "sensevoice",
+    # Remote Qwen3-ASR (vLLM OpenAI audio API). Same box as vLLM LLM, port 8001.
+    "qwen_asr_url": "http://redacted-host:8001/v1",
+    "qwen_asr_model": "Qwen/Qwen3-ASR-1.7B",
+    # Fast-fail an unreachable box on connect; generous read cap for one-shot
+    # transcription so a legitimately-working request is never cut off.
+    "qwen_asr_connect_timeout": 1.0,
+    "qwen_asr_total_timeout": 30.0,
     "llm_enabled": True,
     "ollama_url": "http://127.0.0.1:11434",
     "ollama_model": "qwen3.5:4b",

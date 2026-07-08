@@ -1,8 +1,9 @@
 # WhisperFlow-Local
 
 100% local, offline Cantonese-English dictation menu-bar app for macOS (Apple
-Silicon). Hold a key → record → SenseVoiceSmall ASR → LLM cleanup (remote vLLM
-primary, local Ollama fallback) → paste into the focused app. Python 3.11,
+Silicon). Hold a key → record → ASR (local SenseVoice, or remote Qwen3-ASR
+primary + local fallback) → LLM cleanup (remote vLLM primary, local Ollama
+fallback) → paste into the focused app. Python 3.11,
 `rumps` menu bar. `SPEC.md` is the
 source of truth (acceptance criteria A1–J4) — read it before adding features.
 
@@ -21,9 +22,11 @@ scripts/make_app.sh                               # build ~/Applications/Whisper
 ```
 whisperflow_local/
   app.py        # rumps menu-bar app + record→ASR→LLM→inject pipeline (run via __main__)
-  asr.py        # SenseVoiceSmall (funasr); optional qwen3 engine, falls back to sensevoice
+  asr.py        # ASR backends: SenseVoiceEngine (local, funasr) + RemoteQwenASRBackend (remote vLLM /v1/audio/transcriptions); Qwen3ASREngine (local on-device, off-menu, kept for tests)
+  asr_router.py # ASRRouter: remote Qwen3-ASR primary + local SenseVoice fallback + breaker (mirrors router.py)
   llm.py        # LLM backends: OllamaBackend (local) + VLLMBackend (remote, streaming/TTFT); edit-list prompts, thinking off
   router.py     # LLMRouter: remote-primary + local fallback + 3-strike breaker + cooldown retry
+  breaker.py    # CircuitBreaker: 3-strike trip + cooldown re-probe, shared by both routers
   textproc.py   # voice commands, custom dictionary, punctuation, OpenCC s2hk
   hotkeys.py keycap.py  # global push-to-talk + toggle hotkeys (pynput)
   injector.py   # clipboard + synthesized ⌘V paste, then restore prior clipboard

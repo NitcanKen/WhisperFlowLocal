@@ -15,10 +15,13 @@ Modes (config `llm_backend`):
 
 Only `LLMUnavailable` triggers fallback — a `ValueError` (unknown AI command)
 or other bug propagates unchanged.
+
+The remote-primary + cooldown state lives in a shared `CircuitBreaker`
+(`breaker.py`), which `ASRRouter` also composes.
 """
-import threading
 import time
 
+from .breaker import CircuitBreaker
 from .llm import LLMUnavailable
 
 
@@ -28,14 +31,9 @@ class LLMRouter:
         self.local = local
         self.remote = remote
         self.backend = backend            # "auto" | "local"
-        self.threshold = threshold
-        self.cooldown = cooldown
-        self._clock = clock
+        self._breaker = CircuitBreaker(threshold=threshold, cooldown=cooldown,
+                                       clock=clock)
         self._notify = notify             # notify(event, model): "fallback"|"reconnected"
-        self._lock = threading.Lock()
-        self._consecutive = 0
-        self._temporary = False           # breaker tripped (auto mode only)
-        self._retry_at = 0.0
         self._last_backend = local        # backs the .model property (logging)
 
     # --- public interface (mirrors a backend) ------------------------------
@@ -61,11 +59,8 @@ class LLMRouter:
     # --- runtime configuration ---------------------------------------------
     def set_backend(self, backend):
         """Switch selection. Resets the breaker so a fresh choice starts clean."""
-        with self._lock:
-            self.backend = backend
-            self._temporary = False
-            self._consecutive = 0
-            self._retry_at = 0.0
+        self.backend = backend
+        self._breaker.reset()
 
     def set_local_model(self, model):
         self.local.model = model
@@ -76,44 +71,17 @@ class LLMRouter:
 
     # --- dispatch + breaker ------------------------------------------------
     def _dispatch(self, method, *args, **kwargs):
-        if self.backend == "local" or not self._should_try_remote():
+        if self.backend == "local" or not self._breaker.allow_remote():
             self._last_backend = self.local
             return getattr(self.local, method)(*args, **kwargs)
         try:
             result = getattr(self.remote, method)(*args, **kwargs)
         except LLMUnavailable:
-            self._on_remote_failure()
+            if self._breaker.record_failure() and self._notify:
+                self._notify("fallback", self.local.model)
             self._last_backend = self.local
             return getattr(self.local, method)(*args, **kwargs)
-        self._on_remote_success()
+        if self._breaker.record_success() and self._notify:
+            self._notify("reconnected", self.remote.model)
         self._last_backend = self.remote
         return result
-
-    def _should_try_remote(self):
-        """auto mode: try the remote unless the breaker is tripped and still
-        cooling down. A probe is allowed once the cooldown has elapsed."""
-        with self._lock:
-            if not self._temporary:
-                return True
-            return self._clock() >= self._retry_at
-
-    def _on_remote_success(self):
-        with self._lock:
-            was_temporary = self._temporary
-            self._consecutive = 0
-            self._temporary = False
-            self._retry_at = 0.0
-        if was_temporary and self._notify:
-            self._notify("reconnected", self.remote.model)
-
-    def _on_remote_failure(self):
-        with self._lock:
-            self._consecutive += 1
-            tripped_now = (not self._temporary
-                           and self._consecutive >= self.threshold)
-            if self._temporary or tripped_now:
-                # Either a probe just failed, or we just tripped: (re)arm cooldown.
-                self._temporary = True
-                self._retry_at = self._clock() + self.cooldown
-        if tripped_now and self._notify:
-            self._notify("fallback", self.local.model)

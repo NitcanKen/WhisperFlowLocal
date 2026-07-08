@@ -12,8 +12,15 @@ has 16 GB and Ollama may hold another ~3.4 GB).
 import gc
 import threading
 
+import requests
+
 from .applog import log
 from .textproc import strip_sensevoice_tags
+
+
+class ASRUnavailable(Exception):
+    """Raised when a remote ASR backend cannot be reached, times out, or returns
+    a malformed response. `ASRRouter` treats it as 'remote failed, fall back'."""
 
 # SPEC language modes -> SenseVoice language argument.
 # SenseVoice handles intra-sentence code-switching natively in auto mode,
@@ -150,6 +157,86 @@ class Qwen3ASREngine:
         if not results:
             return ""
         return (results[0].text or "").strip()
+
+
+class RemoteQwenASRBackend:
+    """Remote Qwen3-ASR served by vLLM's OpenAI `/v1/audio/transcriptions`.
+
+    The wav is POSTed as multipart; the hot-word/vocab `context` goes into the
+    `prompt` field for native decode-time biasing (far stronger than SenseVoice's
+    post-hoc phonetic recovery). `timeout=(connect_timeout, total_timeout)`: the
+    connect timeout fast-fails an unreachable/asleep box (the common Tailscale-down
+    case); the read timeout is a generous cap on a one-shot transcription so a
+    legitimately-working request is never cut off. Any failure raises
+    `ASRUnavailable`, never a fabricated transcript, so the router falls back.
+    """
+
+    name = "qwen3"
+
+    def __init__(self, base_url: str, model: str,
+                 connect_timeout: float = 1.0, total_timeout: float = 30.0):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.connect_timeout = connect_timeout
+        self.total_timeout = total_timeout
+
+    def _form_data(self, language: str, context: list) -> dict:
+        """Build the multipart text fields. `context` (the vocab_terms list) goes
+        into `prompt` for native decode-time biasing; language maps via
+        QWEN_LANGUAGE_MAP (auto/mixed omit the field for auto-detect)."""
+        data = {"model": self.model, "response_format": "json"}
+        lang = QWEN_LANGUAGE_MAP.get(language)
+        if lang:
+            data["language"] = lang
+        if context:
+            prompt = ", ".join(str(t).strip() for t in context if str(t).strip())
+            if prompt:
+                data["prompt"] = prompt
+        return data
+
+    def _parse_response(self, resp) -> str:
+        """Validate the HTTP response and extract the transcript, or raise
+        ASRUnavailable so the router falls back — never a fabricated transcript."""
+        if resp.status_code != 200:
+            raise ASRUnavailable(
+                f"Qwen3-ASR HTTP {resp.status_code} at {self.base_url}"
+            )
+        try:
+            body = resp.json()
+        except ValueError as exc:  # malformed JSON body
+            raise ASRUnavailable(
+                f"Qwen3-ASR bad response at {self.base_url}: {exc}"
+            ) from exc
+        if not isinstance(body, dict) or "text" not in body:
+            raise ASRUnavailable(f"Qwen3-ASR malformed response: {body!r:.80}")
+        return (body.get("text") or "").strip()
+
+    def transcribe(self, wav_path: str, language: str = "auto",
+                   context: list = None) -> str:
+        with open(wav_path, "rb") as f:
+            audio = f.read()
+        try:
+            resp = requests.post(
+                f"{self.base_url}/audio/transcriptions",
+                files={"file": ("audio.wav", audio, "audio/wav")},
+                data=self._form_data(language, context),
+                timeout=(self.connect_timeout, self.total_timeout),
+            )
+        except requests.RequestException as exc:
+            raise ASRUnavailable(
+                f"Qwen3-ASR unreachable/slow at {self.base_url}: "
+                f"{exc.__class__.__name__}"
+            ) from exc
+        return self._parse_response(resp)
+
+    def ping(self) -> bool:
+        try:
+            requests.get(
+                f"{self.base_url}/models", timeout=self.connect_timeout + 2
+            ).raise_for_status()
+            return True
+        except requests.RequestException:
+            return False
 
 
 class ASREngine:

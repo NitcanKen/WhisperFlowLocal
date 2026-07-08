@@ -21,6 +21,13 @@ of truth. "Done" = every acceptance criterion below is implemented for real and 
 - **ASR = SenseVoiceSmall** via **`funasr`** `AutoModel("iic/SenseVoiceSmall")` + `fsmn-vad`,
   auto-language + inverse-text-normalization; emotion/event tags stripped from output.
   (Accepted equivalent if funasr install fails: `sherpa-onnx` SenseVoice int8.)
+- **ASR backends (as of 2026-07-08):** the recognizer is dual-backend, mirroring the LLM — a
+  remote **Qwen3-ASR** (vLLM OpenAI `/v1/audio/transcriptions`, port 8001) is primary with the
+  local SenseVoice as automatic fallback + the same 3-strike breaker/cooldown (shared
+  `breaker.CircuitBreaker`). `asr_router.ASRRouter` composes them; menu → ASR Engine pins local.
+  Hotwords (`vocab_terms`) bias the remote natively via the request `prompt` and still drive
+  `apply_phonetic_hotwords` for SenseVoice. See
+  `docs/superpowers/specs/2026-07-08-qwen-asr-remote-backend-design.md`.
 - **LLM = `qwen3.5:4b` via Ollama** (already installed), local API. Qwen3 is a hybrid reasoning
   model → **thinking mode MUST be disabled** (`think:false` / append `/no_think`) so it returns
   only the corrected text, no `<think>` blocks.

@@ -17,7 +17,8 @@ import rumps
 
 from . import APP_NAME, launchagent, paths, permissions
 from .applog import log
-from .asr import ASREngine
+from .asr import RemoteQwenASRBackend, SenseVoiceEngine
+from .asr_router import ASRRouter
 from .audio import Recorder, duration_seconds, save_wav
 from .config import Config
 from .frontmost import frontmost_app_name
@@ -69,7 +70,7 @@ class WhisperFlowApp(rumps.App):
         self.config = Config()
         set_language(self.config.get("ui_language"))
         self.recorder = Recorder()
-        self.asr = ASREngine(self.config.get("asr_engine"))
+        self.asr = self._build_asr_router()
         self.history = History()
         self.llm = self._build_router()
 
@@ -79,10 +80,12 @@ class WhisperFlowApp(rumps.App):
         self._last_insert_path = ""
         self._last_formatted = ""
         self._history_dirty = True
-        # Set by the LLMRouter notify callback (worker thread); the main-thread
-        # UI timer picks it up and shows the fallback/reconnect notice.
+        # Set by the LLMRouter / ASRRouter notify callbacks (worker thread); the
+        # main-thread UI timer picks them up and shows the fallback/reconnect notice.
         self._llm_switch_dirty = False
         self._llm_switch_note = None
+        self._asr_switch_dirty = False
+        self._asr_switch_note = None
         self._jobs = queue.Queue()
         self.overlay = WaveformOverlay()
         self.keycap = KeyCapturePanel()
@@ -334,6 +337,9 @@ class WhisperFlowApp(rumps.App):
         if self._llm_switch_dirty:
             self._llm_switch_dirty = False
             self._apply_llm_switch(*self._llm_switch_note)
+        if self._asr_switch_dirty:
+            self._asr_switch_dirty = False
+            self._apply_asr_switch(*self._asr_switch_note)
 
     def _rebuild_history_menu(self):
         try:
@@ -547,9 +553,44 @@ class WhisperFlowApp(rumps.App):
     def _set_engine(self, sender):
         self.config.set("asr_engine", sender._engine_code)
         self.asr.set_engine(sender._engine_code)
+        if sender._engine_code == "sensevoice":
+            self.menu_engine.title = tr("menu_engine")  # clear any fallback tag
         self._sync_checkmarks()
         # Warm the newly selected engine off the main thread.
         threading.Thread(target=self._preload, daemon=True).start()
+
+    def _build_asr_router(self):
+        c = self.config
+        local = SenseVoiceEngine()
+        remote = RemoteQwenASRBackend(
+            c.get("qwen_asr_url"), c.get("qwen_asr_model"),
+            connect_timeout=c.get("qwen_asr_connect_timeout"),
+            total_timeout=c.get("qwen_asr_total_timeout"),
+        )
+        # asr_engine "qwen3" -> remote-primary auto; "sensevoice" -> local-only.
+        backend = "auto" if c.get("asr_engine") == "qwen3" else "local"
+        return ASRRouter(
+            local=local, remote=remote, backend=backend,
+            threshold=c.get("fallback_threshold"),
+            cooldown=c.get("fallback_cooldown"),
+            notify=self._on_asr_switch,
+        )
+
+    def _on_asr_switch(self, event, engine):
+        """ASRRouter callback (worker thread) — defer all UI to the timer."""
+        self._asr_switch_note = (event, engine)
+        self._asr_switch_dirty = True
+
+    def _apply_asr_switch(self, event, engine):
+        """Main-thread: reflect an ASR breaker trip / reconnect in menu + notice."""
+        if event == "fallback":
+            self.menu_engine.title = tr("menu_engine") + tr("engine_fallback_tag")
+            self.state_msg = tr("status_asr_fallback")
+            _notify(tr("notify_asr_fallback_title"), tr("notify_asr_fallback_body"))
+        else:  # reconnected
+            self.menu_engine.title = tr("menu_engine")
+            self.state_msg = tr("status_asr_reconnected")
+            _notify(tr("notify_asr_reconnect_title"), tr("notify_asr_reconnect_body"))
 
     def _build_router(self):
         c = self.config

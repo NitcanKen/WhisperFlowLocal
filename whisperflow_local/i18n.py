@@ -42,10 +42,36 @@ S = {
     "menu_profile": ("Formatting Profile", "格式化模式"),
     "menu_language": ("ASR Language", "辨識語言"),
     "menu_engine": ("ASR Engine", "辨識引擎"),
-    "engine_sensevoice": ("SenseVoice (fast)", "SenseVoice（快）"),
+    "engine_sensevoice": ("SenseVoice — local", "SenseVoice — 本地"),
     "engine_qwen3": (
-        "Qwen3-ASR (accurate + hotwords)",
-        "Qwen3-ASR（更準 + 支援詞彙偏好）",
+        "Qwen3-ASR — remote (auto-fallback)",
+        "Qwen3-ASR — 遠端（自動後備）",
+    ),
+    "engine_fallback_tag": (" — ⚠︎ SenseVoice fallback", " — ⚠︎ 改用 SenseVoice"),
+    "status_asr_fallback": (
+        "Remote Qwen3-ASR unreachable — using local SenseVoice.",
+        "遠端 Qwen3-ASR 未能連接 — 改用本地 SenseVoice。",
+    ),
+    "status_asr_reconnected": (
+        "Reconnected to remote Qwen3-ASR.",
+        "已重新連接遠端 Qwen3-ASR。",
+    ),
+    "notify_asr_fallback_title": (
+        "Switched to local ASR",
+        "已切換到本地辨識",
+    ),
+    "notify_asr_fallback_body": (
+        "Remote Qwen3-ASR unreachable after repeated tries — using local "
+        "SenseVoice. Will retry the remote automatically.",
+        "遠端 Qwen3-ASR 多次連接失敗 — 暫用本地 SenseVoice，稍後會自動重試遠端。",
+    ),
+    "notify_asr_reconnect_title": (
+        "Back on remote ASR",
+        "已切換回遠端辨識",
+    ),
+    "notify_asr_reconnect_body": (
+        "Remote Qwen3-ASR reachable again.",
+        "遠端 Qwen3-ASR 恢復連接。",
     ),
     "menu_llm": ("AI Cleanup (Ollama)", "AI 清理（Ollama）"),
     "menu_model": ("AI Model", "AI 模型"),
