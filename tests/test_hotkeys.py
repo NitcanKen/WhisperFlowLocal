@@ -1,6 +1,9 @@
 """HotkeyManager: single persistent listener, runtime rebind, own combo
 matching, and key-capture mode. All tests drive _on_press/_on_release
 directly — no real pynput Listener is ever started."""
+import threading
+import time
+
 import pytest
 from pynput import keyboard
 
@@ -96,6 +99,83 @@ def test_rebind_swaps_targets_without_touching_listener():
     assert counts["down"] == 1
     mgr._on_release(keyboard.Key.f18)
     assert counts["up"] == 1
+
+
+# ------------------------------------------------------------ off-thread dispatch
+#
+# Root-cause regression: pynput invokes _on_press/_on_release synchronously on
+# the macOS CGEventTap thread. macOS silently disables a tap whose callback runs
+# longer than ~1 s, and pynput never re-enables it — so a slow recorder.start()/
+# stop() (device open, Bluetooth) killed the listener: the key release was never
+# delivered, recording never stopped, and re-pressing did nothing until restart.
+# Once the pump is running, callbacks MUST run off the tap thread.
+
+def test_slow_callback_does_not_block_the_listener_thread():
+    started = threading.Event()
+    release = threading.Event()
+    done = threading.Event()
+
+    def slow_down():
+        started.set()
+        release.wait(2.0)
+        done.set()
+
+    mgr = HotkeyManager(
+        "alt_r", "",
+        on_ptt_down=slow_down, on_ptt_up=lambda: None, on_toggle=lambda: None,
+    )
+    mgr._start_pump()
+    try:
+        t0 = time.perf_counter()
+        mgr._on_press(keyboard.Key.alt_r)  # must return at once, not block
+        elapsed = time.perf_counter() - t0
+        assert started.wait(1.0)     # callback did start (on the pump thread)
+        assert elapsed < 0.1         # but _on_press did NOT wait for it
+        assert not done.is_set()     # it is still running off the tap thread
+    finally:
+        release.set()
+        assert done.wait(1.0)
+        mgr._stop_pump()
+
+
+def test_dispatched_callbacks_keep_press_then_release_order():
+    order = []
+    mgr = HotkeyManager(
+        "alt_r", "",
+        on_ptt_down=lambda: order.append("down"),
+        on_ptt_up=lambda: order.append("up"),
+        on_toggle=lambda: None,
+    )
+    mgr._start_pump()
+    try:
+        mgr._on_press(keyboard.Key.alt_r)
+        mgr._on_release(keyboard.Key.alt_r)
+        deadline = time.time() + 1.0
+        while len(order) < 2 and time.time() < deadline:
+            time.sleep(0.005)
+        assert order == ["down", "up"]
+    finally:
+        mgr._stop_pump()
+
+
+def test_a_raising_callback_does_not_kill_the_pump():
+    order = []
+    mgr = HotkeyManager(
+        "alt_r", "",
+        on_ptt_down=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        on_ptt_up=lambda: order.append("up"),
+        on_toggle=lambda: None,
+    )
+    mgr._start_pump()
+    try:
+        mgr._on_press(keyboard.Key.alt_r)   # raises inside the pump
+        mgr._on_release(keyboard.Key.alt_r)  # pump must survive and run this
+        deadline = time.time() + 1.0
+        while not order and time.time() < deadline:
+            time.sleep(0.005)
+        assert order == ["up"]
+    finally:
+        mgr._stop_pump()
 
 
 # ------------------------------------------------------------ toggle combo

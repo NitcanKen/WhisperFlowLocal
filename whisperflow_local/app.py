@@ -566,6 +566,8 @@ class WhisperFlowApp(rumps.App):
             c.get("qwen_asr_url"), c.get("qwen_asr_model"),
             connect_timeout=c.get("qwen_asr_connect_timeout"),
             total_timeout=c.get("qwen_asr_total_timeout"),
+            api_key=(os.environ.get("WHISPERFLOW_QWEN_ASR_API_KEY")
+                     or c.get("qwen_asr_api_key")),
         )
         # asr_engine "qwen3" -> remote-primary auto; "sensevoice" -> local-only.
         backend = "auto" if c.get("asr_engine") == "qwen3" else "local"
@@ -600,6 +602,8 @@ class WhisperFlowApp(rumps.App):
             connect_timeout=c.get("vllm_connect_timeout"),
             ttft_timeout=c.get("vllm_ttft_timeout"),
             total_timeout=c.get("vllm_total_timeout"),
+            api_key=(os.environ.get("WHISPERFLOW_VLLM_API_KEY")
+                     or c.get("vllm_api_key")),
         )
         return LLMRouter(
             local=local, remote=remote,

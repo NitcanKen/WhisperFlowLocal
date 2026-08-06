@@ -51,6 +51,16 @@ def test_form_data_blank_context_no_prompt():
     assert "prompt" not in b._form_data("en", ["", "  "])  # nothing real to bias
 
 
+def test_bearer_auth_headers_are_optional():
+    assert RemoteQwenASRBackend("http://x/v1", "m")._auth_headers() == {}
+    secured = RemoteQwenASRBackend(
+        "http://x/v1", "m", api_key="unit-test-key"  # pragma: allowlist secret
+    )
+    assert secured._auth_headers() == {
+        "Authorization": "Bearer unit-test-key",
+    }
+
+
 def test_parse_response_extracts_text():
     b = RemoteQwenASRBackend("http://x/v1", "m")
     assert b._parse_response(FakeResp({"text": "  hello world  "})) == "hello world"

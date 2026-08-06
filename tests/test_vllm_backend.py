@@ -54,6 +54,16 @@ def test_think_block_stripped_from_stream():
     assert THINK_RE.sub("", raw).strip() == "Answer"
 
 
+def test_bearer_auth_headers_are_optional():
+    assert VLLMBackend("http://x/v1", "m")._auth_headers() == {}
+    secured = VLLMBackend(
+        "http://x/v1", "m", api_key="unit-test-key"  # pragma: allowlist secret
+    )
+    assert secured._auth_headers() == {
+        "Authorization": "Bearer unit-test-key",
+    }
+
+
 def test_connect_failure_raises_unavailable():
     b = VLLMBackend("http://127.0.0.1:1/v1", "m",
                     connect_timeout=0.5, ttft_timeout=0.5)

@@ -17,9 +17,12 @@ DEFAULTS = {
     #                  local SenseVoice fallback + circuit breaker (see asr_router.py).
     #   "sensevoice" = SenseVoice only; the remote is never contacted.
     "asr_engine": "sensevoice",
-    # Remote Qwen3-ASR (vLLM OpenAI audio API). Same box as vLLM LLM, port 8001.
-    "qwen_asr_url": "http://redacted-host:8001/v1",
+    # Optional Qwen3-ASR endpoint (vLLM OpenAI audio API). Local-only by
+    # default; change this in config.json when opting into a trusted remote.
+    "qwen_asr_url": "http://127.0.0.1:8001/v1",
     "qwen_asr_model": "Qwen/Qwen3-ASR-1.7B",
+    # Optional bearer token. WHISPERFLOW_QWEN_ASR_API_KEY takes precedence.
+    "qwen_asr_api_key": "",
     # Fast-fail an unreachable box on connect; generous read cap for one-shot
     # transcription so a legitimately-working request is never cut off.
     "qwen_asr_connect_timeout": 1.0,
@@ -31,9 +34,11 @@ DEFAULTS = {
     #   "auto"  = remote vLLM (OpenAI /v1) primary + local Ollama fallback +
     #             circuit breaker (see router.py).
     #   "local" = Ollama only; the remote is never contacted.
-    "llm_backend": "auto",
-    "vllm_url": "http://redacted-host:8000/v1",
+    "llm_backend": "local",
+    "vllm_url": "http://127.0.0.1:8000/v1",
     "vllm_model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+    # Optional bearer token. WHISPERFLOW_VLLM_API_KEY takes precedence.
+    "vllm_api_key": "",
     # Fall back to local if the remote can't connect within this many seconds,
     # or sends no first token within the TTFT deadline (streaming). A generous
     # total cap only guards a stream that dribbles forever.
@@ -91,6 +96,10 @@ class Config:
         with _lock:
             if os.path.exists(self.path):
                 try:
+                    os.chmod(self.path, 0o600)
+                except OSError:
+                    pass
+                try:
                     with open(self.path, "r", encoding="utf-8") as f:
                         stored = json.load(f)
                     merged = dict(DEFAULTS)
@@ -105,6 +114,7 @@ class Config:
             paths.ensure_dirs()
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
+                os.chmod(tmp, 0o600)
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
 

@@ -188,11 +188,18 @@ class RemoteQwenASRBackend:
     name = "qwen3"
 
     def __init__(self, base_url: str, model: str,
-                 connect_timeout: float = 1.0, total_timeout: float = 30.0):
+                 connect_timeout: float = 1.0, total_timeout: float = 30.0,
+                 api_key: str = ""):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.connect_timeout = connect_timeout
         self.total_timeout = total_timeout
+        self.api_key = (api_key or "").strip()
+
+    def _auth_headers(self) -> dict:
+        if not self.api_key:
+            return {}
+        return {"Authorization": f"Bearer {self.api_key}"}
 
     def _form_data(self, language: str, context: list) -> dict:
         """Build the multipart text fields. `context` (the vocab_terms list) goes
@@ -234,6 +241,7 @@ class RemoteQwenASRBackend:
                 f"{self.base_url}/audio/transcriptions",
                 files={"file": ("audio.wav", audio, "audio/wav")},
                 data=self._form_data(language, context),
+                headers=self._auth_headers(),
                 timeout=(self.connect_timeout, self.total_timeout),
             )
         except requests.RequestException as exc:
@@ -246,7 +254,8 @@ class RemoteQwenASRBackend:
     def ping(self) -> bool:
         try:
             requests.get(
-                f"{self.base_url}/models", timeout=self.connect_timeout + 2
+                f"{self.base_url}/models", headers=self._auth_headers(),
+                timeout=self.connect_timeout + 2,
             ).raise_for_status()
             return True
         except requests.RequestException:

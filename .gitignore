@@ -1,4 +1,7 @@
 .venv/
+.env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -6,3 +9,10 @@ build/
 dist/
 *.spec
 launcher.py
+.DS_Store
+.claude/settings.local.json
+config.json
+*.pem
+*.key
+*.p12
+*.pfx

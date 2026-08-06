@@ -1,8 +1,9 @@
 # WhisperFlow-Local
 
-100% local, offline **Cantonese-English dictation** for macOS (Apple Silicon).
+Local-first **Cantonese-English dictation** for macOS (Apple Silicon).
 Hold a key, speak in 廣東話, English, or 中英夾雜 — the transcript is cleaned up
-by a local LLM and pasted into whatever app you're using. No cloud, ever.
+by a local LLM and pasted into whatever app you're using. No third-party cloud
+service is required; self-hosted remote models are available as an explicit opt-in.
 
 - **ASR**: [SenseVoiceSmall](https://www.modelscope.cn/models/iic/SenseVoiceSmall)
   via funasr — the best-benchmarked open model for Cantonese-English
@@ -49,6 +50,31 @@ language automatically (English / 廣東話 zh-HK); override in
 On first run the SenseVoiceSmall model (~1 GB) downloads automatically and is
 cached under `~/.cache/modelscope`; afterwards the app is fully offline
 (the only network traffic is to `localhost` Ollama).
+
+## Optional self-hosted remote models
+
+WhisperFlow starts in local-only mode. Advanced users can opt into an
+OpenAI-compatible vLLM server for LLM cleanup, Qwen3-ASR, or both by editing:
+
+`~/Library/Application Support/WhisperFlow-Local/config.json`
+
+Only the keys you want to override are required:
+
+```json
+{
+  "llm_backend": "auto",
+  "vllm_url": "http://vllm-host.example:8000/v1",
+  "vllm_api_key": "",
+  "asr_engine": "qwen3",
+  "qwen_asr_url": "http://asr-host.example:8001/v1",
+  "qwen_asr_api_key": ""
+}
+```
+
+Bearer tokens are optional. Prefer the `WHISPERFLOW_VLLM_API_KEY` and
+`WHISPERFLOW_QWEN_ASR_API_KEY` environment variables when your launch method
+supports them; otherwise the matching config values are stored in a user-only
+file (`0600`). Use TLS or a trusted private network for any non-local endpoint.
 
 ## Grant permissions (one time)
 
@@ -132,7 +158,10 @@ any time without dictating: `.venv/bin/python scripts/overlay_demo.py`
 
 ## Privacy
 
-Audio and text never leave your Mac. Network access is limited to the
-first-run model download and `http://127.0.0.1:11434` (Ollama). History lives
-in `~/Library/Application Support/WhisperFlow-Local/history.sqlite3` — clear it
-any time from the menu.
+By default, audio and dictated text never leave your Mac. Network access is
+limited to the first-run model download and local Ollama. If you explicitly
+enable a remote ASR backend, audio is sent to the configured endpoint; if you
+enable a remote LLM backend, transcripts are sent to that endpoint. No
+third-party telemetry is included. History lives in
+`~/Library/Application Support/WhisperFlow-Local/history.sqlite3` — clear it any
+time from the menu.

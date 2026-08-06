@@ -13,9 +13,12 @@ the crash path.
 
 Requires the macOS Input Monitoring permission.
 """
+import queue
 import threading
 
 from pynput import keyboard
+
+from .applog import log
 
 # Left/right/plain modifier variants collapse to one canonical name.
 MODIFIER_MAP = {}
@@ -133,6 +136,10 @@ class HotkeyManager:
         self._mods_held = set()
         self._capture = None
         self._listener = None
+        # Callbacks are dispatched to this FIFO thread instead of running inline
+        # on the pynput tap thread — see _fire.
+        self._cb_queue = queue.Queue()
+        self._pump = None
 
     # -- event handling (listener thread) --------------------------------
     def _on_press(self, key):
@@ -156,9 +163,9 @@ class HotkeyManager:
                 self._combo_latched = True
                 fire_toggle = True
         if fire_down:
-            self.on_ptt_down()
+            self._fire(self.on_ptt_down)
         if fire_toggle:
-            self.on_toggle()
+            self._fire(self.on_toggle)
 
     def _on_release(self, key):
         mod = MODIFIER_MAP.get(key)
@@ -173,7 +180,55 @@ class HotkeyManager:
                 self._ptt_held = False
                 fire_up = True
         if fire_up:
-            self.on_ptt_up()
+            self._fire(self.on_ptt_up)
+
+    # -- off-thread callback dispatch ------------------------------------
+    def _fire(self, callback) -> None:
+        """Run a PTT/toggle callback OFF the pynput tap thread.
+
+        pynput invokes _on_press/_on_release synchronously on the macOS
+        CGEventTap run-loop thread. macOS disables a tap whose callback runs
+        longer than ~1 s (kCGEventTapDisabledByTimeout) and pynput 1.8.2 never
+        re-enables it. recorder.start()/stop() (opening/closing the audio
+        device — slow with Bluetooth mics or under load) could exceed that,
+        silently killing the listener: the key release was never delivered, so
+        recording never stopped and re-pressing the key did nothing until the
+        app was restarted. Dispatching to a dedicated FIFO thread keeps the tap
+        callback effectively instant.
+
+        Before the pump is started (unit tests, or pre-start()), run inline so
+        callback effects are observable synchronously.
+        """
+        if self._pump is None:
+            callback()
+        else:
+            self._cb_queue.put(callback)
+
+    def _pump_loop(self) -> None:
+        while True:
+            callback = self._cb_queue.get()
+            if callback is None:  # shutdown sentinel
+                return
+            try:
+                callback()
+            except Exception as exc:
+                # A failing callback must never kill the dispatch thread, or
+                # every later hotkey would be silently dropped.
+                log("hotkey", f"callback error: {exc!r}")
+
+    def _start_pump(self) -> None:
+        if self._pump is not None:
+            return
+        self._pump = threading.Thread(
+            target=self._pump_loop, name="hotkey-pump", daemon=True
+        )
+        self._pump.start()
+
+    def _stop_pump(self) -> None:
+        if self._pump is None:
+            return
+        self._pump = None  # _fire falls back to inline once cleared
+        self._cb_queue.put(None)  # unblock and end the loop
 
     def _handle_capture_press(self, capture, key, mod):
         """Called with the lock held; consumes the event."""
@@ -217,6 +272,7 @@ class HotkeyManager:
         """Create the ONE listener. Called exactly once at app startup."""
         if self._listener is not None:
             return
+        self._start_pump()  # before the listener, so no event runs inline
         self._listener = keyboard.Listener(
             on_press=self._on_press, on_release=self._on_release
         )
@@ -228,6 +284,7 @@ class HotkeyManager:
         if self._listener is not None:
             self._listener.stop()
             self._listener = None
+        self._stop_pump()
 
     def update(self, ptt_key_name: str, toggle_combo: str) -> None:
         """Re-bind hotkeys at runtime by swapping match targets. The

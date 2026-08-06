@@ -8,8 +8,9 @@ Status: Approved (design), ready for implementation
 Today the LLM cleanup layer (`whisperflow_local/llm.py`) talks only to the local
 Ollama `/api/chat` API with `qwen3.5:4b`. The user now runs a much stronger model
 on a separate machine: **`nvidia/Qwen3.6-35B-A3B-NVFP4` served by vLLM** over the
-**OpenAI-compatible API** at `http://redacted-host:8000/v1` (reachable via
-Tailscale). Confirmed live: `GET /v1/models` returns that model id,
+**OpenAI-compatible API** at a private endpoint such as
+`http://vllm-host.example:8000/v1`. During development, `GET /v1/models`
+returned that model id with
 `max_model_len` 262144.
 
 Goal: make the **remote 35B the primary** LLM for all cleanup / formatting / AI
@@ -34,7 +35,8 @@ remote stops costing latency on every dictation.
 - No streaming of partial text into the target app (we still paste once, whole).
   Streaming is used only internally to measure TTFT.
 - No change to ASR, hotkeys, injection, history, or the Ollama wire format.
-- No auth on the vLLM endpoint (LAN/Tailscale only).
+- Optional Bearer authentication is supported; transport security remains the
+  endpoint operator's responsibility.
 
 ## 3. Architecture (Approach A: base + two backends + router)
 
@@ -135,13 +137,16 @@ already degrades to pasting raw ASR with a notice.
   extra body for Qwen3 chat template) **and** the existing `<think>…</think>`
   strip as belt-and-suspenders. (No `think` field — that is Ollama-only.)
 - Health probe (`ping`): `GET {vllm_url}/models`, short timeout.
+- When `vllm_api_key` is configured, both requests include
+  `Authorization: Bearer <token>`.
 
 ## 7. Config additions (`config.py` DEFAULTS)
 
 ```python
-"llm_backend": "auto",                 # "auto" (remote primary + fallback) | "local"
-"vllm_url": "http://redacted-host:8000/v1",
+"llm_backend": "local",                # privacy-safe default; "auto" opts into remote
+"vllm_url": "http://127.0.0.1:8000/v1",
 "vllm_model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+"vllm_api_key": "",                    # optional; environment variable takes precedence
 "vllm_connect_timeout": 1.0,
 "vllm_ttft_timeout": 1.0,              # seconds to first token before fallback
 "vllm_total_timeout": 30.0,           # wall-clock safety cap once streaming

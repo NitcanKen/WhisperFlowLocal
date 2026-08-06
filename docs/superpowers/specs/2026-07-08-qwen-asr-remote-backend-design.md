@@ -11,8 +11,8 @@ Today the ASR layer (`whisperflow_local/asr.py`) runs entirely on-device: an
 latter falling back to SenseVoice if it fails to load.
 
 The user now serves **the same `Qwen/Qwen3-ASR-1.7B` via vLLM** on a separate GPU
-box at `http://redacted-host:8001/v1` (reachable over Tailscale). Confirmed live:
-`GET /v1/models` returns that id (`max_model_len` 65536) and
+box at a private endpoint such as `http://asr-host.example:8001/v1`. During
+development, `GET /v1/models` returned that id (`max_model_len` 65536) and
 `POST /v1/audio/transcriptions` is registered (`allow: POST`).
 
 Goal — mirror the LLM router already shipped (`router.py` + `VLLMBackend`): make the
@@ -29,7 +29,7 @@ audio: `/v1/audio/transcriptions` returns `"Invalid or unsupported audio file"`
 `/v1/chat/completions` with `input_audio` returns
 `"Please install vllm[audio] for audio support"`. The operator must
 `pip install "vllm[audio]"` (pulls `librosa`/`soundfile`) and restart vLLM on
-`redacted-host`. The client in this design is built and unit-tested regardless; the
+the private host. The client in this design is built and unit-tested regardless; the
 **live** round-trip (AC1/AC3) is verified once the box is fixed. This is the one
 external dependency and is subject to the §14 blocker rule.
 
@@ -56,7 +56,8 @@ external dependency and is subject to the §14 blocker rule.
 - No change to the on-device `Qwen3ASREngine` *class* or its tests; it is only
   **removed from the engine menu** (2-mode menu, mirroring the LLM's auto/local).
 - No change to VAD, capture, injection, hotkeys, history, or the SenseVoice wire.
-- No auth on the vLLM endpoint (LAN/Tailscale only).
+- Optional Bearer authentication is supported; transport security remains the
+  endpoint operator's responsibility.
 - No streaming of partial transcripts into the target app (we paste once, whole).
 
 ## 3. Architecture (base engines + remote backend + router)
@@ -114,6 +115,8 @@ composes the same class. Net: both routers get thinner. See §5.
   raise **`ASRUnavailable`** (the router's fallback trigger). Never returns a
   fabricated transcript.
 - `ping()`: `GET {qwen_asr_url}/models`, short timeout → bool.
+- When `qwen_asr_api_key` is configured, both requests include
+  `Authorization: Bearer <token>`.
 
 > Verification caveat (§1a): the exact biasing field could not be exercised live
 > because the box can't decode audio yet. `prompt` is the OpenAI-standard field vLLM
@@ -179,8 +182,9 @@ No new config, no second list, no pipeline change. The hotword question reduces 
 
 ```python
 "asr_engine": "sensevoice",             # unchanged key: "qwen3" (remote+fallback) | "sensevoice"
-"qwen_asr_url": "http://redacted-host:8001/v1",
+"qwen_asr_url": "http://127.0.0.1:8001/v1",
 "qwen_asr_model": "Qwen/Qwen3-ASR-1.7B",
+"qwen_asr_api_key": "",                # optional; environment variable takes precedence
 "qwen_asr_connect_timeout": 1.0,        # fast-fail an unreachable box
 "qwen_asr_total_timeout": 30.0,         # generous read deadline for one-shot transcription
 ```

@@ -277,12 +277,19 @@ class VLLMBackend(BaseLLMBackend):
 
     def __init__(self, base_url: str, model: str,
                  connect_timeout: float = 1.0, ttft_timeout: float = 1.0,
-                 total_timeout: float = 30.0, clock=time.monotonic):
+                 total_timeout: float = 30.0, clock=time.monotonic,
+                 api_key: str = ""):
         super().__init__(base_url, model, timeout=total_timeout)
         self.connect_timeout = connect_timeout
         self.ttft_timeout = ttft_timeout
         self.total_timeout = total_timeout
         self._clock = clock
+        self.api_key = (api_key or "").strip()
+
+    def _auth_headers(self) -> dict:
+        if not self.api_key:
+            return {}
+        return {"Authorization": f"Bearer {self.api_key}"}
 
     def _read_stream(self, resp) -> str:
         """Accumulate `choices[0].delta.content` from an SSE stream until
@@ -334,6 +341,7 @@ class VLLMBackend(BaseLLMBackend):
             resp = requests.post(
                 f"{self.base_url}/chat/completions",
                 json=payload, stream=True,
+                headers=self._auth_headers(),
                 timeout=(self.connect_timeout, self.ttft_timeout),
             )
             if resp.status_code != 200:
@@ -352,7 +360,8 @@ class VLLMBackend(BaseLLMBackend):
     def ping(self) -> bool:
         try:
             requests.get(
-                f"{self.base_url}/models", timeout=self.connect_timeout + 2
+                f"{self.base_url}/models", headers=self._auth_headers(),
+                timeout=self.connect_timeout + 2,
             ).raise_for_status()
             return True
         except requests.RequestException:
