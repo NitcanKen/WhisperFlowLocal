@@ -45,6 +45,12 @@ DEFAULTS = {
     "vllm_connect_timeout": 1.0,
     "vllm_ttft_timeout": 1.0,
     "vllm_total_timeout": 30.0,
+    # Reasoning-effort budget for reasoning-capable remotes (e.g. DeepSeek-V4).
+    # "none" disables the chain-of-thought — essential for dictation latency:
+    # with reasoning on, an utterance can take 6-60 s and the answer arrives in
+    # the reasoning channel. Empty string omits the field for servers that
+    # reject it. enable_thinking (Qwen) is sent separately and is ignored here.
+    "vllm_reasoning_effort": "none",
     # After this many consecutive fallbacks, pin to local; re-probe the remote
     # after fallback_cooldown seconds (auto-retry).
     "fallback_threshold": 3,

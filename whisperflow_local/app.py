@@ -604,6 +604,7 @@ class WhisperFlowApp(rumps.App):
             total_timeout=c.get("vllm_total_timeout"),
             api_key=(os.environ.get("WHISPERFLOW_VLLM_API_KEY")
                      or c.get("vllm_api_key")),
+            reasoning_effort=c.get("vllm_reasoning_effort"),
         )
         return LLMRouter(
             local=local, remote=remote,

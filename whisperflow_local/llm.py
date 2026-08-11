@@ -279,13 +279,14 @@ class VLLMBackend(BaseLLMBackend):
     def __init__(self, base_url: str, model: str,
                  connect_timeout: float = 1.0, ttft_timeout: float = 1.0,
                  total_timeout: float = 30.0, clock=time.monotonic,
-                 api_key: str = ""):
+                 api_key: str = "", reasoning_effort: str = "none"):
         super().__init__(base_url, model, timeout=total_timeout)
         self.connect_timeout = connect_timeout
         self.ttft_timeout = ttft_timeout
         self.total_timeout = total_timeout
         self._clock = clock
         self.api_key = (api_key or "").strip()
+        self.reasoning_effort = (reasoning_effort or "").strip()
 
     def _auth_headers(self) -> dict:
         headers = {
@@ -351,14 +352,19 @@ class VLLMBackend(BaseLLMBackend):
             ],
             "stream": True,
             "temperature": 0 if force_json else 0.2,
-            # Disable thinking in chat templates that support this flag (keeps
-            # the reasoning channel terse where honored — e.g. Qwen3).
+            # Disable thinking in chat templates that support this flag (Qwen3).
             "chat_template_kwargs": {"enable_thinking": False},
             # Deployments that ignore the flag above stream the final answer
             # through the reasoning channel; keep it included so _read_stream can
             # salvage it when content is empty (do NOT suppress it).
             "include_reasoning": True,
         }
+        # DeepSeek-V4 and other reasoning models ignore enable_thinking; their
+        # kill switch is reasoning_effort="none", which both removes the 6-60 s
+        # think latency and returns the answer via content. Omitted when blank
+        # so plain non-reasoning servers that reject the field are unaffected.
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         if force_json:
             payload["response_format"] = {"type": "json_object"}
         try:

@@ -110,8 +110,24 @@ def test_chat_requests_final_content_without_reasoning(monkeypatch):
     # Reasoning must stay included: deployments that ignore enable_thinking put
     # the final answer there, and _read_stream salvages it when content is empty.
     assert captured["json"]["include_reasoning"] is True
-    assert "reasoning_effort" not in captured["json"]
+    # DeepSeek-V4's real reasoning kill switch — defaults to "none".
+    assert captured["json"]["reasoning_effort"] == "none"
     assert captured["headers"]["ngrok-skip-browser-warning"] == "1"
+
+
+def test_reasoning_effort_omitted_when_blank(monkeypatch):
+    # Plain non-reasoning vLLM servers may reject an unknown field; a blank
+    # setting must drop it from the payload entirely.
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured.update(kwargs)
+        return FakeResp(_sse(["OK"]))
+
+    monkeypatch.setattr("whisperflow_local.llm.requests.post", fake_post)
+    backend = VLLMBackend("http://x/v1", "m", reasoning_effort="")
+    backend._chat("s", "u")
+    assert "reasoning_effort" not in captured["json"]
 
 
 def test_connect_failure_raises_unavailable():
