@@ -272,7 +272,8 @@ class VLLMBackend(BaseLLMBackend):
     (down / crashed / queued), requests raises and we surface LLMUnavailable so
     the router falls back. Once tokens flow, `total_timeout` is a wall-clock
     safety cap on a stream that never ends. Thinking is disabled via the vLLM
-    chat-template kwarg and stripped defensively.
+    chat-template kwarg, reasoning deltas are excluded from the response, and
+    any leaked think block is stripped defensively.
     """
 
     def __init__(self, base_url: str, model: str,
@@ -287,15 +288,28 @@ class VLLMBackend(BaseLLMBackend):
         self.api_key = (api_key or "").strip()
 
     def _auth_headers(self) -> dict:
-        if not self.api_key:
-            return {}
-        return {"Authorization": f"Bearer {self.api_key}"}
+        headers = {
+            "Accept": "text/event-stream",
+            # Harmless on normal vLLM deployments and required to keep ngrok's
+            # free-tier browser interstitial out of API responses.
+            "ngrok-skip-browser-warning": "1",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
     def _read_stream(self, resp) -> str:
-        """Accumulate `choices[0].delta.content` from an SSE stream until
-        [DONE]. Enforces the wall-clock total cap; ignores malformed lines."""
+        """Accumulate the answer from an SSE stream until [DONE]. Enforces the
+        wall-clock total cap; ignores malformed lines.
+
+        Prefers `delta.content`. Some reasoning-model deployments (observed on
+        DeepSeek-V4-Flash) ignore the non-thinking flags and stream the FINAL
+        answer through the reasoning channel with `content` left empty; when no
+        content arrives at all we fall back to the reasoning text so the backend
+        isn't a silent no-op. `THINK_RE` in `_chat` strips any leaked block."""
         start = self._clock()
-        parts = []
+        content_parts = []
+        reasoning_parts = []
         try:
             for line in resp.iter_lines(decode_unicode=True):
                 if self._clock() - start > self.total_timeout:
@@ -316,12 +330,17 @@ class VLLMBackend(BaseLLMBackend):
                 choices = obj.get("choices") or []
                 if not choices:
                     continue
-                piece = (choices[0].get("delta") or {}).get("content")
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content")
                 if piece:
-                    parts.append(piece)
+                    content_parts.append(piece)
+                rpiece = delta.get("reasoning") or delta.get("reasoning_content")
+                if rpiece:
+                    reasoning_parts.append(rpiece)
         finally:
             resp.close()
-        return "".join(parts)
+        content = "".join(content_parts)
+        return content if content.strip() else "".join(reasoning_parts)
 
     def _chat(self, system: str, user: str, force_json: bool = False) -> str:
         payload = {
@@ -332,8 +351,13 @@ class VLLMBackend(BaseLLMBackend):
             ],
             "stream": True,
             "temperature": 0 if force_json else 0.2,
-            # Disable Qwen3 thinking for the vLLM chat template.
+            # Disable thinking in chat templates that support this flag (keeps
+            # the reasoning channel terse where honored — e.g. Qwen3).
             "chat_template_kwargs": {"enable_thinking": False},
+            # Deployments that ignore the flag above stream the final answer
+            # through the reasoning channel; keep it included so _read_stream can
+            # salvage it when content is empty (do NOT suppress it).
+            "include_reasoning": True,
         }
         if force_json:
             payload["response_format"] = {"type": "json_object"}

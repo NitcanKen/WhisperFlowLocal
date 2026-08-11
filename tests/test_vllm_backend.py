@@ -25,10 +25,10 @@ class FakeResp:
         self.closed = True
 
 
-def _sse(pieces):
+def _sse(pieces, field="content"):
     lines = ['data: {"choices":[{"delta":{"role":"assistant"}}]}']
     for p in pieces:
-        lines.append("data: " + json.dumps({"choices": [{"delta": {"content": p}}]}))
+        lines.append("data: " + json.dumps({"choices": [{"delta": {field: p}}]}))
     lines.append("data: [DONE]")
     return lines
 
@@ -48,6 +48,26 @@ def test_read_stream_ignores_malformed_lines():
     assert b._read_stream(FakeResp(lines)) == "ok"
 
 
+def test_reasoning_channel_salvaged_when_content_empty():
+    # DeepSeek-V4-Flash-style deployment: the final answer streams through the
+    # reasoning channel and `content` never arrives. The backend must salvage it
+    # instead of returning "" (which silently no-ops the whole LLM layer).
+    b = VLLMBackend("http://x/v1", "m")
+    resp = FakeResp(_sse(['{"edits": [', '{"from":"a","to":"b"}', "]}"],
+                          field="reasoning"))
+    assert b._read_stream(resp) == '{"edits": [{"from":"a","to":"b"}]}'
+
+
+def test_content_channel_wins_over_reasoning():
+    # When both channels stream, content is the real answer; reasoning is CoT.
+    b = VLLMBackend("http://x/v1", "m")
+    lines = ['data: {"choices":[{"delta":{"role":"assistant"}}]}',
+             'data: {"choices":[{"delta":{"reasoning":"thinking..."}}]}',
+             'data: {"choices":[{"delta":{"content":"Answer"}}]}',
+             "data: [DONE]"]
+    assert b._read_stream(FakeResp(lines)) == "Answer"
+
+
 def test_think_block_stripped_from_stream():
     b = VLLMBackend("http://x/v1", "m")
     raw = b._read_stream(FakeResp(_sse(["<think>", "reasoning", "</think>", "Answer"])))
@@ -55,13 +75,43 @@ def test_think_block_stripped_from_stream():
 
 
 def test_bearer_auth_headers_are_optional():
-    assert VLLMBackend("http://x/v1", "m")._auth_headers() == {}
+    base_headers = {
+        "Accept": "text/event-stream",
+        "ngrok-skip-browser-warning": "1",
+    }
+    assert VLLMBackend("http://x/v1", "m")._auth_headers() == base_headers
     secured = VLLMBackend(
         "http://x/v1", "m", api_key="unit-test-key"  # pragma: allowlist secret
     )
     assert secured._auth_headers() == {
-        "Authorization": "Bearer unit-test-key",
+        **base_headers, "Authorization": "Bearer unit-test-key",
     }
+
+
+def test_chat_requests_final_content_without_reasoning(monkeypatch):
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return FakeResp(_sse(["OK"]))
+
+    monkeypatch.setattr("whisperflow_local.llm.requests.post", fake_post)
+    backend = VLLMBackend(
+        "https://example.ngrok-free.dev/v1", "DeepSeek-V4-Flash-0731",
+        api_key="unit-test-key",  # pragma: allowlist secret
+    )
+
+    assert backend._chat("Be concise", "Reply OK") == "OK"
+    assert captured["url"].endswith("/v1/chat/completions")
+    assert captured["json"]["chat_template_kwargs"] == {
+        "enable_thinking": False,
+    }
+    # Reasoning must stay included: deployments that ignore enable_thinking put
+    # the final answer there, and _read_stream salvages it when content is empty.
+    assert captured["json"]["include_reasoning"] is True
+    assert "reasoning_effort" not in captured["json"]
+    assert captured["headers"]["ngrok-skip-browser-warning"] == "1"
 
 
 def test_connect_failure_raises_unavailable():
