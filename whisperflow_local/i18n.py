@@ -29,9 +29,10 @@ S = {
     "status_clarifying": ("Need one thing first…", "想問你一樣嘢先…"),
     "status_gen_cancelled": ("Generation cancelled.", "已取消生成。"),
     "clarify_hint": (
-        "press 1-3, or type an answer  ·  esc to cancel",
-        "撳 1-3，或者自己打  ·  esc 取消",
+        "press 1-3 to choose  ·  esc to cancel",
+        "撳 1-3 揀  ·  esc 取消",
     ),
+    "clarify_other": ("or type your own answer…", "或者喺度打你嘅答案…"),
     "status_gen_empty": (
         "The model returned nothing — nothing inserted.",
         "模型冇返任何內容 — 冇插入任何嘢。",

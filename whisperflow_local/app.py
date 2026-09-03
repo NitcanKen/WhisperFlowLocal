@@ -95,6 +95,10 @@ class WhisperFlowApp(rumps.App):
         # pattern as _llm_switch_note/_llm_switch_dirty above).
         self._clarify_req = None
         self._clarify_dirty = False
+        # Set once the card starts closing; the request is resolved only after
+        # it has finished, so the worker's Cmd+V can never land in our panel
+        # and the closing animation is actually seen.
+        self._clarify_pending = None
         self._session_mode = "dictate"
         self._capture_session = None
         self._capture_kind = None
@@ -646,13 +650,27 @@ class WhisperFlowApp(rumps.App):
         # The panel takes the keyboard, so stop holds/toggles firing beneath it.
         self.hotkeys.set_suppressed(True)
         try:
-            self.clarify.show(q["question"], q["options"], tr("clarify_hint"))
+            # Drop the pill instantly: the card is born at its exact rect and
+            # grows out of it, so the two must not animate against each other.
+            self.overlay.snap_closed()
+            self.clarify.show(q["question"], q["options"],
+                              tr("clarify_hint"), tr("clarify_other"))
         except Exception as exc:
             log("clarify", f"panel show failed: {exc!r}")
             self._finish_clarify(req, "cancelled")
 
     def _poll_clarify(self):
         """Main thread, ~30 Hz. Never blocks."""
+        pending = self._clarify_pending
+        if pending is not None:
+            # Wait out the closing animation before letting the worker paste.
+            if self.clarify.is_visible():
+                return
+            self._clarify_pending = None
+            req, state, answers = pending
+            self.hotkeys.set_suppressed(False)
+            req.resolve(state, answers)
+            return
         req = self._clarify_req
         if req is None or req.done.is_set():
             return
@@ -683,16 +701,22 @@ class WhisperFlowApp(rumps.App):
             self._show_clarify(req)
 
     def _finish_clarify(self, req, state, answers=None):
-        """The one place a clarify round ends. The ordering is load-bearing:
-        the panel must give up the keyboard BEFORE the worker resumes, or the
-        synthesized ⌘V would paste into our own panel."""
+        """The one place a clarify round ends.
+
+        The ordering is load-bearing: the card must be fully off screen before
+        the worker resumes, or the synthesized ⌘V would paste into our own
+        panel. So this only STARTS the close; _poll_clarify resolves the
+        request once the animation has finished.
+        """
+        self._clarify_req = None
         try:
-            self.clarify.hide()
+            self.clarify.begin_hide()
         except Exception as exc:
             log("clarify", f"hide failed: {exc!r}")
-        self.hotkeys.set_suppressed(False)
-        self._clarify_req = None
-        req.resolve(state, answers)
+            self.hotkeys.set_suppressed(False)
+            req.resolve(state, answers)
+            return
+        self._clarify_pending = (req, state, answers)
 
     # ------------------------------------------------------------ callbacks
     def _set_profile(self, sender):

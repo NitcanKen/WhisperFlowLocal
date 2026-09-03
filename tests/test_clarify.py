@@ -8,8 +8,16 @@ import threading
 from whisperflow_local.clarify import (
     CLARIFY_TIMEOUT,
     CLARIFY_W,
+    CLOSE_GATE_FLOOR,
+    CONTENT_GATE,
+    CONTENT_RISE,
     PAD,
     ClarifyRequest,
+    blend_rect,
+    close_gate,
+    content_alpha,
+    content_offset,
+    morph_rect,
     digit_to_index,
     option_rects,
     other_rect,
@@ -164,3 +172,72 @@ def test_parse_clarify_drops_blank_options_and_questions():
         '{"questions": [{"question": "  ", "options": ["a", "b"]},'
         ' {"question": "q", "options": ["a", "  ", "b"]}]}')
     assert out == [{"question": "q", "options": ["a", "b"]}]
+
+
+# ------------------------------------------------------------- motion
+# The card is born at the pill's rect and grows out of it, so the two read as
+# one object rather than two windows appearing in sequence.
+
+PILL = (100.0, 96.0, 300.0, 44.0)
+CARD = (60.0, 96.0, 380.0, 202.0)
+
+
+def test_morph_starts_at_the_pill_and_ends_at_the_card():
+    assert morph_rect(0.0, True, PILL, CARD) == PILL
+    assert morph_rect(1.0, True, PILL, CARD) == CARD
+
+
+def test_morph_keeps_the_bottom_edge_pinned():
+    # Both rects share a bottom edge, so every frame must too — that is what
+    # makes it read as the pill growing upward.
+    for p in (0.0, 0.25, 0.5, 0.75, 1.0):
+        assert morph_rect(p, True, PILL, CARD)[1] == PILL[1]
+
+
+def test_morph_overshoots_while_opening_but_not_while_closing():
+    # Opening borrows the pill's ease_out_back, so width may briefly exceed
+    # the card's; closing is ease_in_cubic and must never overshoot.
+    assert max(morph_rect(p / 20.0, True, PILL, CARD)[2]
+               for p in range(21)) > CARD[2]
+    assert max(morph_rect(p / 20.0, False, PILL, CARD)[2]
+               for p in range(21)) <= CARD[2] + 1e-9
+
+
+def test_blend_rect_absorbs_a_target_change_without_jumping():
+    # Question 2 may have a different option count; the height must ease.
+    cur = blend_rect(None, PILL)
+    assert cur == PILL
+    nxt = blend_rect(cur, CARD)
+    assert PILL[3] < nxt[3] < CARD[3]
+
+
+def test_content_reveal_is_staggered_and_ordered():
+    alphas = [content_alpha(0.5, i, 5) for i in range(5)]
+    assert alphas == sorted(alphas, reverse=True)   # earlier elements lead
+    assert alphas[0] == 1.0 and alphas[-1] < 1.0
+
+
+def test_every_element_is_fully_revealed_by_the_end():
+    for count in (3, 4, 5, 6):
+        assert all(content_alpha(1.0, i, count) == 1.0 for i in range(count))
+
+
+def test_nothing_is_revealed_at_the_start():
+    assert all(content_alpha(0.0, i, 5) == 0.0 for i in range(1, 5))
+
+
+def test_text_prints_while_the_box_is_still_growing():
+    # Waiting for the box to finish leaves a beat where a full-size empty
+    # card just sits there, which is what made it feel bolted on.
+    assert CONTENT_GATE < 1.0
+    assert close_gate(0.9, True) > 0.0
+
+
+def test_text_clears_before_the_box_folds_shut():
+    assert close_gate(CLOSE_GATE_FLOOR, False) == 0.0
+    assert close_gate(0.3, False) == 0.0        # box still 30% open, text gone
+
+
+def test_content_offset_rises_into_place():
+    assert content_offset(0.0) == CONTENT_RISE
+    assert content_offset(1.0) == 0.0

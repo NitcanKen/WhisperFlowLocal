@@ -488,5 +488,20 @@ class WaveformOverlay:
         if self._panel.isVisible():
             self._wave.setNeedsDisplay_(True)
 
+    def snap_closed(self) -> None:
+        """Hide the pill instantly, with no fold animation.
+
+        Used when the clarify card takes over: the card is born at exactly
+        this pill's rect and grows from it, so animating the pill shut at the
+        same time would show two objects doing two different things.
+        """
+        self._p = 0.0
+        self._wfactor = 0.0
+        self._last_w = -1.0
+        self._history = []
+        if self._panel is not None and self._panel.isVisible():
+            self._panel.orderOut_(None)
+        self._stop_timer()
+
     def is_visible(self) -> bool:
         return bool(self._panel is not None and self._panel.isVisible())
