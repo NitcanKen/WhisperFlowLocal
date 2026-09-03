@@ -8,7 +8,7 @@ Part B: the EXACT shipped Clean pipeline
   quick_clean -> apply_phonetic_hotwords -> llm.propose_edits -> apply_edits
 run against the real SenseVoice outputs captured in app.log (per-sentence
 audio is not retained, so we feed the genuine ASR strings), with real
-qwen3.5:4b via Ollama. Prints before -> after so corrections and the
+Qwen3.6-35B-A3B via GB10 vLLM. Prints before -> after so corrections and the
 must-not-change regressions are both visible.
 
 Usage: .venv/bin/python scripts/itest_postcorrect_live.py
@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from whisperflow_local import paths  # noqa: E402
 from whisperflow_local.asr import ASREngine  # noqa: E402
 from whisperflow_local.config import Config  # noqa: E402
-from whisperflow_local.llm import LLMClient  # noqa: E402
+from whisperflow_local.llm import VLLMBackend  # noqa: E402
 from whisperflow_local.textproc import (  # noqa: E402
     apply_edits,
     apply_phonetic_hotwords,
@@ -51,7 +51,7 @@ def main():
     cfg = Config()
     vocab = vocab_terms(cfg.get("dictionary"), cfg.get("hotwords"))
     hk = cfg.get("traditional_hk")
-    print(f"engine={cfg.get('asr_engine')} model={cfg.get('ollama_model')} "
+    print(f"engine={cfg.get('asr_engine')} model={cfg.get('vllm_model')} "
           f"hotwords={vocab}\n")
 
     # ---- Part A: real SenseVoice transcription of the last recording --------
@@ -65,10 +65,18 @@ def main():
     else:
         print("[Part A] no last_recording.wav found; skipping live ASR\n")
 
-    # ---- Part B: full Clean post-correction pipeline, real Ollama -----------
-    llm = LLMClient(cfg.get("ollama_url"), cfg.get("ollama_model"))
+    # ---- Part B: full Clean post-correction pipeline, real GB10 vLLM --------
+    llm = VLLMBackend(
+        cfg.get("vllm_url"), cfg.get("vllm_model"),
+        connect_timeout=cfg.get("vllm_connect_timeout"),
+        ttft_timeout=cfg.get("vllm_ttft_timeout"),
+        total_timeout=cfg.get("vllm_total_timeout"),
+        api_key=(os.environ.get("WHISPERFLOW_VLLM_API_KEY")
+                 or cfg.get("vllm_api_key")),
+        reasoning_effort=cfg.get("vllm_reasoning_effort"),
+    )
     if not llm.ping():
-        print("[Part B] Ollama unreachable — aborting"); sys.exit(1)
+        print("[Part B] GB10 vLLM unreachable — aborting"); sys.exit(1)
 
     print("[Part B] Clean pipeline (quick_clean -> phonetic hotwords -> "
           "LLM edits -> apply_edits):\n")

@@ -1,16 +1,14 @@
 # WhisperFlow-Local
 
-Local-first **Cantonese-English dictation** for macOS (Apple Silicon).
+Private self-hosted **Cantonese-English dictation** for macOS (Apple Silicon).
 Hold a key, speak in 廣東話, English, or 中英夾雜 — the transcript is cleaned up
-by a local LLM and pasted into whatever app you're using. No third-party cloud
-service is required; self-hosted remote models are available as an explicit opt-in.
+by models on the user's GB10 and pasted into whatever app you're using. No
+third-party cloud service is used.
 
-- **ASR**: [SenseVoiceSmall](https://www.modelscope.cn/models/iic/SenseVoiceSmall)
-  via funasr — the best-benchmarked open model for Cantonese-English
-  code-switching (~9% CER on mixed speech).
-- **AI cleanup**: `qwen3.5:4b` via your local [Ollama](https://ollama.com)
-  (thinking mode disabled for instant, clean output). Optional — toggle it off
-  for raw transcripts.
+- **ASR**: `Qwen3-ASR-0.6B` on the private GB10 is primary;
+  SenseVoiceSmall remains the on-Mac ASR fallback.
+- **AI cleanup**: `Qwen3.6-35B-A3B` through the GB10's OpenAI-compatible vLLM API
+  (thinking disabled). Ollama is not used.
 - **Everything else**: native menu-bar app (rumps), global hotkeys (pynput),
   clipboard-paste insertion, per-app formatting profiles, custom dictionary,
   voice commands, SQLite history, launch-at-login.
@@ -19,12 +17,7 @@ service is required; self-hosted remote models are available as an explicit opt-
 
 - macOS on Apple Silicon (built and tested on M4, 16 GB RAM)
 - Python 3.11+ (`brew install python@3.11`)
-- [Ollama](https://ollama.com) running locally with the model pulled:
-
-```bash
-ollama list            # confirm qwen3.5:4b is present
-ollama pull qwen3.5:4b # only if missing
-```
+- Tailscale connectivity to the private GB10 (`100.71.138.54`)
 
 ## Install & run
 
@@ -47,14 +40,12 @@ language automatically (English / 廣東話 zh-HK); override in
 設定 → 介面語言. **Punctuation**: toggle output punctuation on/off in
 設定 → 標點符號.
 
-On first run the SenseVoiceSmall model (~1 GB) downloads automatically and is
-cached under `~/.cache/modelscope`; afterwards the app is fully offline
-(the only network traffic is to `localhost` Ollama).
+If the remote ASR is unavailable, SenseVoiceSmall (~1 GB) downloads on first
+fallback and is cached under `~/.cache/modelscope`.
 
-## Optional self-hosted remote models
+## Private GB10 models
 
-WhisperFlow starts in local-only mode. Advanced users can opt into an
-OpenAI-compatible vLLM server for LLM cleanup, Qwen3-ASR, or both by editing:
+WhisperFlow is configured for the user's private GB10 by editing:
 
 `~/Library/Application Support/WhisperFlow-Local/config.json`
 
@@ -62,11 +53,13 @@ Only the keys you want to override are required:
 
 ```json
 {
-  "llm_backend": "auto",
-  "vllm_url": "http://vllm-host.example:8000/v1",
+  "llm_backend": "remote",
+  "vllm_url": "http://100.71.138.54:8090/v1",
+  "vllm_model": "Qwen3.6-35B-A3B",
   "vllm_api_key": "",
   "asr_engine": "qwen3",
-  "qwen_asr_url": "http://asr-host.example:8001/v1",
+  "qwen_asr_url": "http://100.71.138.54:8800/v1",
+  "qwen_asr_model": "Qwen3-ASR-0.6B",
   "qwen_asr_api_key": ""
 }
 ```
@@ -118,8 +111,8 @@ Terminal/VS Code stays Raw — editable in Settings → Edit Per-App Rules.
 4. Release. You hear the stop cue, the icon shows ✍️ then ✨, and the cleaned
    text pastes at your cursor — Cantonese and English both intact.
 5. Say "scratch that" to delete it; say "… press enter" to auto-send in a chat app.
-6. Quit Ollama and dictate again → the raw transcript still pastes (graceful
-   degradation), with a notice in the menu.
+6. Stop or disconnect the GB10 and dictate again → deterministic cleanup/raw
+   text still pastes; local Ollama is never contacted.
 
 ## Verify the pipeline without the mic
 
@@ -158,10 +151,8 @@ any time without dictating: `.venv/bin/python scripts/overlay_demo.py`
 
 ## Privacy
 
-By default, audio and dictated text never leave your Mac. Network access is
-limited to the first-run model download and local Ollama. If you explicitly
-enable a remote ASR backend, audio is sent to the configured endpoint; if you
-enable a remote LLM backend, transcripts are sent to that endpoint. No
-third-party telemetry is included. History lives in
+Audio is sent only to the private GB10 ASR endpoint, and transcripts are sent
+only to the private GB10 LLM endpoint over Tailscale. Local Ollama and
+third-party cloud APIs are not used; no telemetry is included. History lives in
 `~/Library/Application Support/WhisperFlow-Local/history.sqlite3` — clear it any
 time from the menu.

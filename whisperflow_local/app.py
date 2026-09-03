@@ -27,7 +27,7 @@ from .hotkeys import HotkeyManager
 from .i18n import set_language, tr
 from .keycap import KeyCapturePanel, pretty_combo, pretty_key
 from .injector import copy_to_clipboard, delete_chars, insert, press_enter
-from .llm import AI_COMMANDS, LLMUnavailable, OllamaBackend, PROFILES, VLLMBackend
+from .llm import AI_COMMANDS, LLMUnavailable, PROFILES, VLLMBackend
 from .overlay import WaveformOverlay
 from .router import LLMRouter
 from .sounds import play
@@ -187,7 +187,7 @@ class WhisperFlowApp(rumps.App):
 
         self.menu_model = rumps.MenuItem(tr("menu_model"))
         self._backend_items = {}
-        for code in ("auto", "local"):
+        for code in ("remote",):
             item = rumps.MenuItem(tr(f"model_{code}"), callback=self._set_backend)
             item._backend_code = code
             self._backend_items[code] = item
@@ -222,8 +222,6 @@ class WhisperFlowApp(rumps.App):
         self.menu_settings.add(self.menu_vocab)
         self.menu_settings.add(rumps.MenuItem(tr("menu_edit_rules"),
                                               callback=self._edit_app_rules))
-        self.menu_settings.add(rumps.MenuItem(tr("menu_set_model"),
-                                              callback=self._set_model))
         self.item_copy_only = rumps.MenuItem(tr("menu_copy_only"),
                                              callback=self._toggle_copy_only)
         self.menu_settings.add(self.item_copy_only)
@@ -489,7 +487,7 @@ class WhisperFlowApp(rumps.App):
                     self._vocab_list())
                 log("route", f"quick_clean + hotwords fallback — {exc}")
                 self.state_msg = tr("status_llm_off_raw", err=exc)
-                _notify(tr("notify_ollama_title"), str(exc))
+                _notify(tr("notify_llm_unavailable_title"), str(exc))
         elif profile != "Raw" and parsed.text:
             # LLM toggled off: deterministic cleanup + hot-word recovery so
             # 繁體/spacing and known-term homophones still get fixed offline.
@@ -530,7 +528,7 @@ class WhisperFlowApp(rumps.App):
             self.state = "error"
             self.state_msg = str(exc)
             play("error", self.config.get("sounds"))
-            _notify(tr("notify_ollama_title"), str(exc))
+            _notify(tr("notify_llm_unavailable_title"), str(exc))
             return
         copy_to_clipboard(out)
         self._last_formatted = out
@@ -596,7 +594,6 @@ class WhisperFlowApp(rumps.App):
 
     def _build_router(self):
         c = self.config
-        local = OllamaBackend(c.get("ollama_url"), c.get("ollama_model"))
         remote = VLLMBackend(
             c.get("vllm_url"), c.get("vllm_model"),
             connect_timeout=c.get("vllm_connect_timeout"),
@@ -607,8 +604,8 @@ class WhisperFlowApp(rumps.App):
             reasoning_effort=c.get("vllm_reasoning_effort"),
         )
         return LLMRouter(
-            local=local, remote=remote,
-            backend=c.get("llm_backend"),
+            local=None, remote=remote,
+            backend="remote",
             threshold=c.get("fallback_threshold"),
             cooldown=c.get("fallback_cooldown"),
             notify=self._on_llm_switch,
@@ -617,7 +614,7 @@ class WhisperFlowApp(rumps.App):
     def _set_backend(self, sender):
         self.config.set("llm_backend", sender._backend_code)
         self.llm.set_backend(sender._backend_code)
-        if sender._backend_code == "local":
+        if sender._backend_code in ("remote", "local"):
             self.menu_model.title = tr("menu_model")  # clear any fallback tag
         self._sync_checkmarks()
 
@@ -839,16 +836,6 @@ class WhisperFlowApp(rumps.App):
                 rumps.alert(APP_NAME, tr("dlg_invalid_json_rules"))
                 return
             self.config.set("app_rules", data)
-
-    def _set_model(self, _):
-        resp = rumps.Window(
-            tr("dlg_model_prompt"),
-            APP_NAME, default_text=self.config.get("ollama_model"),
-            dimensions=(260, 24),
-        ).run()
-        if resp.clicked and resp.text.strip():
-            self.config.set("ollama_model", resp.text.strip())
-            self.llm.set_local_model(resp.text.strip())
 
     def _open_config(self, _):
         subprocess.run(["open", paths.APP_SUPPORT], check=False)

@@ -34,10 +34,11 @@ def test_existing_config_permissions_are_hardened(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
-def test_public_defaults_are_local_and_credential_free():
-    assert DEFAULTS["asr_engine"] == "sensevoice"
-    assert DEFAULTS["llm_backend"] == "local"
-    assert DEFAULTS["qwen_asr_url"].startswith("http://127.0.0.1:")
-    assert DEFAULTS["vllm_url"].startswith("http://127.0.0.1:")
+def test_private_gb10_defaults_are_remote_and_credential_free():
+    assert DEFAULTS["asr_engine"] == "qwen3"
+    assert DEFAULTS["llm_backend"] == "remote"
+    assert DEFAULTS["qwen_asr_url"] == "http://100.71.138.54:8800/v1"
+    assert DEFAULTS["vllm_url"] == "http://100.71.138.54:8090/v1"
+    assert DEFAULTS["vllm_model"] == "Qwen3.6-35B-A3B"
     assert DEFAULTS["qwen_asr_api_key"] == ""
     assert DEFAULTS["vllm_api_key"] == ""

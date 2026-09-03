@@ -73,8 +73,12 @@ S = {
         "Remote Qwen3-ASR reachable again.",
         "遠端 Qwen3-ASR 恢復連接。",
     ),
-    "menu_llm": ("AI Cleanup (Ollama)", "AI 清理（Ollama）"),
+    "menu_llm": ("AI Cleanup (GB10)", "AI 清理（GB10）"),
     "menu_model": ("AI Model", "AI 模型"),
+    "model_remote": (
+        "Qwen3.6-35B-A3B — GB10 only",
+        "Qwen3.6-35B-A3B — 只用 GB10",
+    ),
     "model_auto": (
         "Qwen3.6-35B — remote (auto-fallback)",
         "Qwen3.6-35B — 遠端（自動後備）",
@@ -128,7 +132,6 @@ S = {
     ),
     "dlg_vocab_delete": ("Delete 「{item}」?", "刪除「{item}」？"),
     "menu_edit_rules": ("Edit Per-App Rules…", "編輯逐 App 規則…"),
-    "menu_set_model": ("Set Ollama Model…", "設定 Ollama 模型…"),
     "menu_copy_only": ("Copy Only (no auto-paste)", "只複製（唔自動貼上）"),
     "menu_punct": ("Punctuation", "標點符號"),
     "menu_sounds": ("Sound Cues", "音效提示"),
@@ -198,7 +201,10 @@ S = {
         "Menu → Permissions & Setup to grant it, then restart.",
         "自動貼上需要「輔助使用」權限。喺選單 → 權限與設定 授權後重開 app。",
     ),
-    "notify_ollama_title": ("Ollama unavailable", "Ollama 未能連接"),
+    "notify_llm_unavailable_title": (
+        "GB10 AI unavailable",
+        "GB10 AI 未能連接",
+    ),
     "notify_mic_title": ("Microphone error", "麥克風錯誤"),
     "notify_mic_body": (
         "Check System Settings → Privacy & Security → Microphone.",

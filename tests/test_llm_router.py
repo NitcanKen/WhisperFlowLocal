@@ -64,6 +64,27 @@ def test_remote_used_when_healthy():
     assert router.model == "remote-35b"
 
 
+def test_remote_only_never_calls_local_or_falls_back():
+    router, local, remote, _ = make(remote_healthy=False, backend="remote")
+    try:
+        router.format_text("hi", "Clean")
+    except LLMUnavailable:
+        pass
+    else:
+        raise AssertionError("remote-only failure must propagate")
+    assert remote.calls == 1
+    assert local.calls == 0
+    assert router.model == "remote-35b"
+
+
+def test_remote_only_does_not_require_a_local_backend():
+    remote = FakeBackend("gb10-qwen38", reply="REMOTE")
+    router = LLMRouter(local=None, remote=remote, backend="remote")
+    assert router.format_text("hi", "Clean") == "REMOTE"
+    assert router.ping() is True
+    assert router.model == "gb10-qwen38"
+
+
 def test_fallback_on_remote_failure():
     router, local, remote, _ = make(remote_healthy=False)
     assert router.format_text("hi", "Clean") == "LOCAL"

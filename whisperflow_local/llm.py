@@ -10,7 +10,9 @@ Both backends share all prompt-building (`format_text`, `propose_edits`,
   token arrives within a short TTFT deadline, so an asleep/overloaded remote
   fails over fast while a legitimately long generation is never cut off.
 
-`router.LLMRouter` composes the two (remote primary + local fallback + breaker).
+`router.LLMRouter` supports a GB10-only remote mode used by the app. The
+Ollama backend remains only for backward compatibility with older configs and
+unit tests; it is not constructed in remote mode.
 
 Qwen3-family models are hybrid reasoning models. Thinking is disabled — on
 Ollama via `think: false`, on vLLM via `chat_template_kwargs.enable_thinking`

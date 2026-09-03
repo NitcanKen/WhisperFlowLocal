@@ -3,7 +3,7 @@
 
 Measures wall time from *recording stop* to *text output complete*:
   save_wav -> ASR -> dictionary/hotwords -> voice commands
-  -> LLM formatting (Ollama, default profile) -> insertion (test sink =
+  -> LLM formatting (GB10 vLLM, default profile) -> insertion (test sink =
   clipboard-only path, so no window focus is needed).
 
 Models are warmed (one throwaway run per configuration) before timing.
@@ -32,7 +32,7 @@ import soundfile as sf  # noqa: E402
 from whisperflow_local.asr import ASREngine  # noqa: E402
 from whisperflow_local.config import Config  # noqa: E402
 from whisperflow_local.injector import insert  # noqa: E402
-from whisperflow_local.llm import LLMClient, LLMUnavailable  # noqa: E402
+from whisperflow_local.llm import LLMUnavailable, VLLMBackend  # noqa: E402
 from whisperflow_local.textproc import (  # noqa: E402
     apply_dictionary,
     apply_edits,
@@ -102,9 +102,17 @@ def main():
           f"runs per config: {args.runs}")
 
     cfg = Config()
-    llm = LLMClient(cfg.get("ollama_url"), cfg.get("ollama_model"))
+    llm = VLLMBackend(
+        cfg.get("vllm_url"), cfg.get("vllm_model"),
+        connect_timeout=cfg.get("vllm_connect_timeout"),
+        ttft_timeout=cfg.get("vllm_ttft_timeout"),
+        total_timeout=cfg.get("vllm_total_timeout"),
+        api_key=(os.environ.get("WHISPERFLOW_VLLM_API_KEY")
+                 or cfg.get("vllm_api_key")),
+        reasoning_effort=cfg.get("vllm_reasoning_effort"),
+    )
     if not llm.ping():
-        print("WARNING: Ollama unreachable — LLM rows will be skipped")
+        print("WARNING: GB10 vLLM unreachable — deterministic cleanup remains")
 
     rows = []
     for engine_name in args.engines.split(","):

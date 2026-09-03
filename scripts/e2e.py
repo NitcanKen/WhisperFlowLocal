@@ -2,7 +2,7 @@
 
 Generates REAL audio with macOS `say` (TTS -> waveform -> microphone-format
 WAV), runs it through the ACTUAL SenseVoiceSmall model, then through the
-ACTUAL qwen3.5:4b via Ollama with thinking disabled. Prints every stage.
+ACTUAL Qwen3.6-35B-A3B on the private GB10 vLLM endpoint. Prints every stage.
 
 Usage: .venv/bin/python scripts/e2e.py
 """
@@ -14,8 +14,8 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from whisperflow_local.asr import ASREngine
-from whisperflow_local.config import DEFAULTS
-from whisperflow_local.llm import LLMClient, LLMUnavailable
+from whisperflow_local.config import Config
+from whisperflow_local.llm import LLMUnavailable, VLLMBackend
 from whisperflow_local.textproc import apply_dictionary, parse_voice_commands
 
 
@@ -67,9 +67,18 @@ def main() -> int:
     print("[asr] Loading SenseVoiceSmall (first run downloads the model)…")
     asr.ensure_loaded(progress_cb=lambda m: print(f"[asr] {m}"))
 
-    llm = LLMClient(DEFAULTS["ollama_url"], DEFAULTS["ollama_model"])
+    cfg = Config()
+    llm = VLLMBackend(
+        cfg.get("vllm_url"), cfg.get("vllm_model"),
+        connect_timeout=cfg.get("vllm_connect_timeout"),
+        ttft_timeout=cfg.get("vllm_ttft_timeout"),
+        total_timeout=cfg.get("vllm_total_timeout"),
+        api_key=(os.environ.get("WHISPERFLOW_VLLM_API_KEY")
+                 or cfg.get("vllm_api_key")),
+        reasoning_effort=cfg.get("vllm_reasoning_effort"),
+    )
     llm_ok = llm.ping()
-    print(f"[llm] Ollama at {DEFAULTS['ollama_url']} model={DEFAULTS['ollama_model']} "
+    print(f"[llm] GB10 at {cfg.get('vllm_url')} model={cfg.get('vllm_model')} "
           f"reachable={llm_ok}")
 
     failures = 0
@@ -89,7 +98,7 @@ def main() -> int:
             failures += 1
             continue
 
-        withdict = apply_dictionary(transcript, DEFAULTS["dictionary"])
+        withdict = apply_dictionary(transcript, cfg.get("dictionary"))
         parsed = parse_voice_commands(withdict)
         print(f"[clip {i}] after commands: text={parsed.text!r} "
               f"press_enter={parsed.press_enter}")
@@ -97,23 +106,23 @@ def main() -> int:
         if llm_ok and parsed.text:
             try:
                 cleaned = llm.format_text(parsed.text, "Clean")
-                print(f"[clip {i}] qwen3.5 Clean : {cleaned}")
+                print(f"[clip {i}] Qwen3.8 Clean : {cleaned}")
                 if i == 1:
                     email = llm.format_text(parsed.text, "Email")
-                    print(f"[clip {i}] qwen3.5 Email : {email}")
+                    print(f"[clip {i}] Qwen3.8 Email : {email}")
                     translated = llm.run_command("Translate to English", parsed.text)
-                    print(f"[clip {i}] qwen3.5 Translate to English: {translated}")
+                    print(f"[clip {i}] Qwen3.8 Translate to English: {translated}")
             except LLMUnavailable as exc:
                 print(f"[clip {i}] LLM degraded gracefully: {exc}")
         elif not llm_ok:
-            print(f"[clip {i}] LLM skipped (Ollama not reachable) — raw "
+            print(f"[clip {i}] LLM skipped (GB10 not reachable) — raw "
                   f"transcript would be inserted, per graceful degradation.")
 
     print("=" * 72)
     if failures:
         print(f"E2E RESULT: FAIL ({failures} clip(s) produced no transcript)")
         return 1
-    print("E2E RESULT: OK — real audio -> real SenseVoice -> real qwen3.5 pipeline works")
+    print("E2E RESULT: OK — real audio -> real SenseVoice -> real GB10 Qwen3.8 pipeline works")
     return 0
 
 

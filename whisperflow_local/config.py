@@ -16,11 +16,11 @@ DEFAULTS = {
     #   "qwen3"      = remote Qwen3-ASR (vLLM /v1/audio/transcriptions) primary +
     #                  local SenseVoice fallback + circuit breaker (see asr_router.py).
     #   "sensevoice" = SenseVoice only; the remote is never contacted.
-    "asr_engine": "sensevoice",
-    # Optional Qwen3-ASR endpoint (vLLM OpenAI audio API). Local-only by
-    # default; change this in config.json when opting into a trusted remote.
-    "qwen_asr_url": "http://127.0.0.1:8001/v1",
-    "qwen_asr_model": "Qwen/Qwen3-ASR-1.7B",
+    "asr_engine": "qwen3",
+    # Private Tailscale endpoint on the GB10. SenseVoice remains the ASR-only
+    # fallback if the remote recognizer is unavailable.
+    "qwen_asr_url": "http://100.71.138.54:8800/v1",
+    "qwen_asr_model": "Qwen3-ASR-0.6B",
     # Optional bearer token. WHISPERFLOW_QWEN_ASR_API_KEY takes precedence.
     "qwen_asr_api_key": "",
     # Fast-fail an unreachable box on connect; generous read cap for one-shot
@@ -28,23 +28,19 @@ DEFAULTS = {
     "qwen_asr_connect_timeout": 1.0,
     "qwen_asr_total_timeout": 30.0,
     "llm_enabled": True,
-    "ollama_url": "http://127.0.0.1:11434",
-    "ollama_model": "qwen3.5:4b",
-    # LLM backend selection:
-    #   "auto"  = remote vLLM (OpenAI /v1) primary + local Ollama fallback +
-    #             circuit breaker (see router.py).
-    #   "local" = Ollama only; the remote is never contacted.
-    "llm_backend": "local",
-    "vllm_url": "http://127.0.0.1:8000/v1",
-    "vllm_model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+    # LLM backend selection is fixed to the private GB10. A remote failure
+    # degrades to deterministic cleanup; the app never constructs Ollama.
+    "llm_backend": "remote",
+    "vllm_url": "http://100.71.138.54:8090/v1",
+    "vllm_model": "Qwen3.6-35B-A3B",
     # Optional bearer token. WHISPERFLOW_VLLM_API_KEY takes precedence.
     "vllm_api_key": "",
     # Fall back to local if the remote can't connect within this many seconds,
     # or sends no first token within the TTFT deadline (streaming). A generous
     # total cap only guards a stream that dribbles forever.
-    "vllm_connect_timeout": 1.0,
-    "vllm_ttft_timeout": 1.0,
-    "vllm_total_timeout": 30.0,
+    "vllm_connect_timeout": 3.0,
+    "vllm_ttft_timeout": 20.0,
+    "vllm_total_timeout": 60.0,
     # Reasoning-effort budget for reasoning-capable remotes (e.g. DeepSeek-V4).
     # "none" disables the chain-of-thought — essential for dictation latency:
     # with reasoning on, an utterance can take 6-60 s and the answer arrives in
@@ -110,6 +106,10 @@ class Config:
                         stored = json.load(f)
                     merged = dict(DEFAULTS)
                     merged.update(stored)
+                    # Migrate legacy local/auto installs to the GB10-only route.
+                    merged["llm_backend"] = "remote"
+                    merged.pop("ollama_url", None)
+                    merged.pop("ollama_model", None)
                     self.data = merged
                 except (json.JSONDecodeError, OSError):
                     # Corrupt config: keep defaults, do not crash the app.

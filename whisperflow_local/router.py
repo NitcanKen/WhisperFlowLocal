@@ -1,9 +1,11 @@
-"""LLM backend router: remote vLLM primary + local Ollama fallback + breaker.
+"""LLM backend router with remote-only and legacy fallback modes.
 
 Exposes the same interface as a single backend (`format_text`, `propose_edits`,
 `run_command`, `ping`, `.model`) so callers are unchanged.
 
 Modes (config `llm_backend`):
+- "remote": every call goes to vLLM. Failures propagate to the app's
+  deterministic cleanup path; Ollama is never contacted.
 - "local": every call goes to the local Ollama backend; the remote is never
   contacted.
 - "auto": every call goes to the remote first. On any `LLMUnavailable` (TTFT
@@ -30,11 +32,11 @@ class LLMRouter:
                  cooldown=300.0, clock=time.monotonic, notify=None):
         self.local = local
         self.remote = remote
-        self.backend = backend            # "auto" | "local"
+        self.backend = backend            # "remote" | "auto" | "local"
         self._breaker = CircuitBreaker(threshold=threshold, cooldown=cooldown,
                                        clock=clock)
         self._notify = notify             # notify(event, model): "fallback"|"reconnected"
-        self._last_backend = local        # backs the .model property (logging)
+        self._last_backend = remote if backend == "remote" else local
 
     # --- public interface (mirrors a backend) ------------------------------
     def format_text(self, text, profile, vocab=None):
@@ -47,6 +49,8 @@ class LLMRouter:
         return self._dispatch("run_command", command, text)
 
     def ping(self):
+        if self.backend == "remote":
+            return self.remote.ping()
         if self.backend == "local":
             return self.local.ping()
         return self.remote.ping() or self.local.ping()
@@ -63,7 +67,8 @@ class LLMRouter:
         self._breaker.reset()
 
     def set_local_model(self, model):
-        self.local.model = model
+        if self.local is not None:
+            self.local.model = model
 
     def set_remote(self, url, model):
         self.remote.base_url = url.rstrip("/")
@@ -71,6 +76,9 @@ class LLMRouter:
 
     # --- dispatch + breaker ------------------------------------------------
     def _dispatch(self, method, *args, **kwargs):
+        if self.backend == "remote":
+            self._last_backend = self.remote
+            return getattr(self.remote, method)(*args, **kwargs)
         if self.backend == "local" or not self._breaker.allow_remote():
             self._last_backend = self.local
             return getattr(self.local, method)(*args, **kwargs)

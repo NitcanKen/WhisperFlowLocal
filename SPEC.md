@@ -5,8 +5,9 @@ A **complete**, 100% local, offline Cantonese-English dictation app for macOS (A
 of truth. "Done" = every acceptance criterion below is implemented for real and demonstrated.
 
 ## 0. Principles (non-negotiable)
-- **100% local / offline.** The only network access allowed is (a) first-run model downloads and
-  (b) `localhost` Ollama. No telemetry, no cloud ASR/LLM.
+- **Private self-hosted inference.** Network model traffic is limited to the
+  user's GB10 over Tailscale plus first-run model downloads. No telemetry or
+  third-party cloud ASR/LLM.
 - **No mocks.** Zero fake / hardcoded / placeholder / stubbed transcripts or LLM outputs anywhere.
   Every layer calls the real model. `grep -riE "mock|fake|dummy|stub|placeholder|hardcode|lorem|TODO"`
   over source returns nothing meaningful.
@@ -28,15 +29,12 @@ of truth. "Done" = every acceptance criterion below is implemented for real and 
   Hotwords (`vocab_terms`) bias the remote natively via the request `prompt` and still drive
   `apply_phonetic_hotwords` for SenseVoice. See
   `docs/superpowers/specs/2026-07-08-qwen-asr-remote-backend-design.md`.
-- **LLM = `qwen3.5:4b` via Ollama** (already installed), local API. Qwen3 is a hybrid reasoning
-  model → **thinking mode MUST be disabled** (`think:false` / append `/no_think`) so it returns
-  only the corrected text, no `<think>` blocks.
-- **LLM backends (as of 2026-07-07):** the cleanup layer is now dual-backend — a remote vLLM
-  server (`Qwen3.6-35B`, OpenAI `/v1`, streaming with a ~1 s time-to-first-token fallback) is
-  primary, with the local Ollama `qwen3.5:4b` as automatic fallback and a 3-strike circuit
-  breaker + cooldown auto-retry. `router.LLMRouter` composes them; menu → AI Model pins local.
-  See `docs/superpowers/specs/2026-07-07-vllm-primary-llm-backend-design.md`. Thinking stays off
-  on both.
+- **LLM = `Qwen3.6-35B-A3B` via vLLM on the private GB10.** Thinking mode MUST be
+  disabled so it returns only the corrected text, with no `<think>` blocks.
+- **LLM backend (as of 2026-08-27):** `llm_backend="remote"` sends every cleanup
+  request to the GB10 OpenAI `/v1` endpoint. Remote failure propagates to the
+  app's deterministic cleanup path; local Ollama is never contacted. Legacy
+  backend classes remain only for compatibility with older configs/tests.
 - Clipboard via **`pyperclip`**. History via **SQLite** (stdlib `sqlite3`).
 - Config as JSON under `~/Library/Application Support/WhisperFlow-Local/`.
 
@@ -99,9 +97,10 @@ of truth. "Done" = every acceptance criterion below is implemented for real and 
 
 ### H. Robustness & privacy
 - H1 UI never blocks (threaded pipeline).
-- H2 Ollama down → fall back to raw ASR with a clear message; model missing → actionable error.
-- H3 No network calls except localhost Ollama + first-run downloads (documented; grep/report).
-- AC: an Ollama-down path shown degrading gracefully (e.g. by pointing the client at a bad port in a test).
+- H2 GB10 LLM down → deterministic cleanup/raw ASR with a clear message; model
+  missing → actionable error; never call Ollama.
+- H3 Model network calls are limited to private GB10 endpoints + first-run downloads.
+- AC: a dead-GB10 path shown degrading gracefully without an Ollama fallback.
 
 ### I. Packaging
 - I1 One-command run after `pip install -r requirements.txt` (documented entrypoint).
@@ -110,8 +109,8 @@ of truth. "Done" = every acceptance criterion below is implemented for real and 
 - AC: entrypoint runs; launch-at-login toggles a real LaunchAgent/login item.
 
 ### J. Testing & verification
-- J1 Real **end-to-end** script: real audio → real SenseVoiceSmall transcript → real qwen3.5:4b
-  cleanup → printed output.
+- J1 Real **end-to-end** script: real audio → real SenseVoiceSmall transcript →
+  real GB10 Qwen3.8 cleanup → printed output.
 - J2 Automated tests for: voice-command parsing (C3), dictionary replacement (D1), per-app profile
   selection (D2), history storage (F1), tag-stripping (B1). All pass, output shown.
 - J3 No-mocks grep (Principle 0) run and shown clean.

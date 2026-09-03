@@ -1,9 +1,9 @@
 # WhisperFlow-Local
 
-100% local, offline Cantonese-English dictation menu-bar app for macOS (Apple
-Silicon). Hold a key → record → ASR (local SenseVoice, or remote Qwen3-ASR
-primary + local fallback) → LLM cleanup (remote vLLM primary, local Ollama
-fallback) → paste into the focused app. Python 3.11,
+Private Cantonese-English dictation menu-bar app for macOS (Apple Silicon).
+Hold a key → record → ASR (GB10 Qwen3-ASR primary + local SenseVoice fallback)
+→ LLM cleanup (GB10 Qwen3.8 vLLM only; no Ollama fallback) → paste into the
+focused app. Python 3.11,
 `rumps` menu bar. `SPEC.md` is the
 source of truth (acceptance criteria A1–J4) — read it before adding features.
 
@@ -55,8 +55,8 @@ tests/    # pytest; conftest isolates app.log from the real one
 ## Gotchas
 - Never run capture / ASR / LLM on the AppKit main thread — the menu-bar UI must
   never freeze. Keep the pipeline on worker threads.
-- Degrade, never crash: Ollama down → paste raw ASR with a notice; mic/model
-  missing → actionable error.
+- Degrade, never crash: GB10 LLM down → deterministic cleanup/raw ASR with a
+  notice, never Ollama; mic/model missing → actionable error.
 - After `make_app.sh` rebuilds the .app, macOS TCC can silently deny
   Accessibility / Input Monitoring even though System Settings still shows them
   ON (the binary's cdhash changed). The script resets stale grants; if paste or
