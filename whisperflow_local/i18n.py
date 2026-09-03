@@ -29,8 +29,8 @@ S = {
     "status_clarifying": ("Need one thing first…", "想問你一樣嘢先…"),
     "status_gen_cancelled": ("Generation cancelled.", "已取消生成。"),
     "clarify_hint": (
-        "press 1-3 to choose  ·  esc to cancel",
-        "撳 1-3 揀  ·  esc 取消",
+        "press 1-3 to choose  ·  esc to write it now",
+        "撳 1-3 揀  ·  esc 唔使問，直接寫",
     ),
     "clarify_other": ("or type your own answer…", "或者喺度打你嘅答案…"),
     "status_gen_empty": (

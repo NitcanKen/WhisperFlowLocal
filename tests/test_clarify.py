@@ -17,6 +17,7 @@ from whisperflow_local.clarify import (
     close_gate,
     content_alpha,
     content_offset,
+    field_text_rect,
     morph_rect,
     digit_to_index,
     option_rects,
@@ -241,3 +242,42 @@ def test_text_clears_before_the_box_folds_shut():
 def test_content_offset_rises_into_place():
     assert content_offset(0.0) == CONTENT_RISE
     assert content_offset(1.0) == 0.0
+
+
+# ------------------------------------------------------------- esc / skip
+
+def test_field_text_line_is_centred_in_its_ground():
+    # An NSTextField lays text out at the TOP of its frame, so a field sized
+    # to the whole ground types in the top-left corner.
+    ground = other_rect(2)
+    fx, fy, fw, fh = field_text_rect(ground)
+    gx, gy, gw, gh = ground
+    assert fh < gh
+    assert abs((fy - gy) - ((gy + gh) - (fy + fh))) < 1e-9   # equal margins
+    assert fx > gx and fx + fw < gx + gw                     # inset both sides
+
+
+def test_skipped_still_carries_the_answers_given_so_far():
+    req = ClarifyRequest([{"question": "q1", "options": ["a", "b"]},
+                          {"question": "q2", "options": ["c", "d"]}])
+    req.answers.append("a")
+    req.resolve("skipped", req.answers)
+    assert req.state == "skipped" and req.answers == ["a"]
+
+
+def test_generate_pairs_only_the_answered_questions():
+    # Esc leaves later questions unanswered; they must simply not appear in
+    # the prompt rather than desyncing the pairing.
+    from whisperflow_local.llm import BaseLLMBackend
+    seen = {}
+
+    class B(BaseLLMBackend):
+        def _chat(self, system, user, force_json=False):
+            seen["user"] = user
+            return "written"
+
+    qs = [{"question": "用咩語言寫？", "options": ["English", "繁體中文"]},
+          {"question": "幾正式？", "options": ["正式", "輕鬆"]}]
+    B("http://x", "m").generate("draft an email", questions=qs, answers=["English"])
+    assert "用咩語言寫？" in seen["user"] and "English" in seen["user"]
+    assert "幾正式？" not in seen["user"]

@@ -578,7 +578,9 @@ class WhisperFlowApp(rumps.App):
             answers = []
             if questions:
                 answers = self._ask_clarify(questions)
-                if answers is None:          # cancelled or timed out
+                # Only a panel failure returns None. Esc and a timeout both
+                # come back with the answers so far and still generate.
+                if answers is None:
                     self.state = "idle"
                     self.state_msg = tr("status_gen_cancelled")
                     return
@@ -621,7 +623,9 @@ class WhisperFlowApp(rumps.App):
     def _ask_clarify(self, questions):
         """Worker thread: put the questions on screen and wait for answers.
 
-        Returns the answer list, or None when the user cancelled. Blocking
+        Returns the answers given so far — Esc ("skipped") and a timeout both
+        still generate, because the spoken request is worth writing from
+        either way. None means the panel itself failed. Blocking
         here is safe and intended — this is the worker thread, so the AppKit
         main thread keeps rendering the HUD and the menu throughout.
         """
@@ -682,12 +686,14 @@ class WhisperFlowApp(rumps.App):
             return
         if choice is None:
             if req.expired():
-                # Timing out is not a cancel: generate with what we have
-                # rather than throwing the user's dictation away.
+                # Timing out is not a cancel either: generate with what we
+                # have rather than throwing the user's dictation away.
                 self._finish_clarify(req, "timeout", req.answers)
             return
-        if choice == "cancel":
-            self._finish_clarify(req, "cancelled")
+        if choice == "skip":
+            # Esc means "stop asking and just write it" — the request is still
+            # worth generating from, so this is the timeout path, not a cancel.
+            self._finish_clarify(req, "skipped", req.answers)
             return
         if choice.startswith("opt:"):
             answer = req.questions[req.index]["options"][int(choice[4:])]

@@ -49,11 +49,16 @@ from AppKit import (
     NSAppearanceNameVibrantLight,
     NSBackingStoreBuffered,
     NSColor,
+    NSEdgeInsetsMake,
     NSFont,
+    NSImage,
+    NSImageResizingModeStretch,
+    NSMakeSize,
     NSMakeRect,
     NSPanel,
     NSScreen,
     NSStatusWindowLevel,
+    NSTextAlignmentCenter,
     NSTextField,
     NSView,
     NSViewHeightSizable,
@@ -90,6 +95,7 @@ ROW_H = 34.0
 ROW_GAP = 7.0
 OTHER_H = 30.0
 HINT_H = 15.0
+FIELD_TEXT_H = 18.0        # the editable line, centred in OTHER_H
 CORNER = PILL_H / 2.0      # same radius as the pill: one visual language
 
 # Motion. Slightly slower than the pill's 0.28/0.20 because the card travels
@@ -155,6 +161,18 @@ def other_rect(n_options: int = 0, width: float = CLARIFY_W,
     return (PAD, PAD + HINT_H + ROW_GAP, width - 2 * PAD, OTHER_H)
 
 
+def field_text_rect(ground: tuple) -> tuple:
+    """The editable line inside the free-text field's drawn ground.
+
+    An NSTextField lays its text out at the TOP of its frame, so a field sized
+    to the whole ground types in the top-left corner. Sizing it to one line and
+    centring it in the ground puts the caret where the prompt was.
+    """
+    gx, gy, gw, gh = ground
+    return (gx + 10.0, gy + (gh - FIELD_TEXT_H) / 2.0,
+            gw - 20.0, FIELD_TEXT_H)
+
+
 def title_rect(n_options: int, width: float = CLARIFY_W) -> tuple:
     return (PAD, rows_top(n_options) + HEADER_GAP, width - 2 * PAD, HEADER_H)
 
@@ -206,18 +224,40 @@ def close_gate(p: float, opening: bool) -> float:
 def content_offset(alpha: float, rise: float = CONTENT_RISE) -> float:
     """Points an element is still below its final position."""
     return (1.0 - clamp01(alpha)) * rise
+def _rounded_mask(radius: float) -> "NSImage":
+    """A resizable rounded-rect mask for an NSVisualEffectView.
+
+    Setting cornerRadius + masksToBounds on the layer is NOT enough: the
+    material's backdrop is composited by the window server and ignores layer
+    clipping, so the square corners stay filled — over a light background that
+    shows as pale tabs poking out past the rounded card. setMaskImage_ is the
+    supported way to shape the material, and cap insets let one small image
+    stretch to every size the card animates through.
+    """
+    d = radius * 2.0 + 2.0
+    img = NSImage.alloc().initWithSize_(NSMakeSize(d, d))
+    img.lockFocus()
+    NSColor.blackColor().set()
+    NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+        NSMakeRect(0, 0, d, d), radius, radius).fill()
+    img.unlockFocus()
+    img.setCapInsets_(NSEdgeInsetsMake(radius, radius, radius, radius))
+    img.setResizingMode_(NSImageResizingModeStretch)
+    return img
+
+
 def _srgb(rgb, alpha=1.0):
     return NSColor.colorWithSRGBRed_green_blue_alpha_(
         rgb[0], rgb[1], rgb[2], alpha)
 
 
 def _text(s: str, size: float, weight: float, rgb, alpha: float,
-          right: bool = False):
+          centred: bool = False):
     """One-line attributed string in the app-icon palette."""
     style = NSMutableParagraphStyle.alloc().init()
     style.setLineBreakMode_(NSLineBreakByTruncatingTail)
-    if right:
-        style.setAlignment_(2)  # NSTextAlignmentRight
+    if centred:
+        style.setAlignment_(NSTextAlignmentCenter)
     return NSAttributedString.alloc().initWithString_attributes_(str(s), {
         NSFontAttributeName: NSFont.systemFontOfSize_weight_(size, weight),
         NSForegroundColorAttributeName: _srgb(rgb, alpha),
@@ -237,7 +277,7 @@ class ClarifyRequest:
                  clock=time.monotonic):
         self.questions = list(questions or [])
         self.answers = []
-        self.state = "pending"        # pending|shown|answered|cancelled|timeout
+        self.state = "pending"        # pending|shown|answered|skipped|timeout|cancelled
         self.index = 0                # question currently on screen
         self._clock = clock
         self.deadline = clock() + timeout
@@ -325,13 +365,38 @@ class _ClarifyView(NSView):
                 | NSTrackingActiveAlways,
                 self, None))
 
+    def cancelOperation_(self, sender):
+        """Esc, wherever it lands in the responder chain — including while the
+        free-text field is being edited, which is why keyDown_ alone missed it."""
+        self.choices.put("skip")
+
+    def control_textView_doCommandBySelector_(self, control, view, selector):
+        """Field editor commands. The editor swallows Esc and Return before
+        they can reach the view, so they are intercepted here."""
+        # pyobjc hands the SEL over as a selector object, bytes or str
+        # depending on version — normalise before comparing.
+        name = selector
+        if hasattr(name, "name"):
+            name = name.name()
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", "replace")
+        name = str(name)
+        if "cancelOperation" in name:
+            self.choices.put("skip")
+            return True
+        if "insertNewline" in name:
+            text = str(control.stringValue() or "").strip()
+            self.choices.put(f"other:{text}" if text else "skip")
+            return True
+        return False
+
     def keyDown_(self, event):
         # Only reached when the free-text field is NOT first responder, so a
         # digit typed into that field can never be read as a selection.
         if not getattr(self, "interactive", True):
             return
         if event.keyCode() == 53:            # esc
-            self.choices.put("cancel")
+            self.choices.put("skip")
             return
         chars = str(event.charactersIgnoringModifiers() or "")
         idx = digit_to_index(chars[:1], len(getattr(self, "rects", [])))
@@ -401,9 +466,9 @@ class _ClarifyView(NSView):
                 field, 8.0, 8.0).fill()
             if getattr(self, "other_empty", True):
                 _text(getattr(self, "other_prompt", ""), 12.5, 0.0,
-                      SEPIA, 0.34 * a).drawInRect_(
-                          NSMakeRect(ox + 10.0, field.origin.y + (oh - 17.0) / 2.0,
-                                     ow - 20.0, 17.0))
+                      SEPIA, 0.34 * a, centred=True).drawInRect_(
+                          NSMakeRect(ox + 10.0, field.origin.y + (oh - FIELD_TEXT_H) / 2.0,
+                                     ow - 20.0, FIELD_TEXT_H))
 
         a = alpha_for(count - 1)
         if a > 0.01 and hint:
@@ -480,6 +545,7 @@ class ClarifyPanel:
         effect.setWantsLayer_(True)
         effect.layer().setCornerRadius_(CORNER)
         effect.layer().setMasksToBounds_(True)
+        effect.setMaskImage_(_rounded_mask(CORNER))
         effect.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
 
         view = _ClarifyView.alloc().initWithFrame_(content)
@@ -495,8 +561,11 @@ class ClarifyPanel:
         view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         effect.addSubview_(view)
 
-        other = NSTextField.alloc().initWithFrame_(NSMakeRect(*other_rect()))
+        other = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(*field_text_rect(other_rect())))
         other.setFont_(NSFont.systemFontOfSize_weight_(13.0, 0.0))
+        other.setAlignment_(NSTextAlignmentCenter)
+        other.setDelegate_(view)
         other.setBezeled_(False)
         other.setBordered_(False)
         # The view draws the field's ground (and its prompt when empty) so an
@@ -546,6 +615,11 @@ class ClarifyPanel:
                           self._pill_rect(), self._card_rect())
         self._rect = blend_rect(self._rect, want)
         self._panel.setFrame_display_(NSMakeRect(*self._rect), True)
+        # macOS caches a window's shadow from its shape. Resizing every frame
+        # leaves the shadow computed for the ORIGINAL pill-sized capsule, which
+        # shows up as square grey tabs poking out past the grown card's rounded
+        # corners. Recompute it whenever the frame moves.
+        self._panel.invalidateShadow()
         self._panel.setAlphaValue_(clamp01(self._p / 0.25))
 
         w = self._rect[2]
@@ -557,11 +631,12 @@ class ClarifyPanel:
         self._view.interactive = self._opening and gate > 0.6
         self._view.setNeedsDisplay_(True)
 
-        ox, oy, ow, oh = other_rect(self._n, w)
+        ground = other_rect(self._n, w)
         field_a = content_alpha(self._content_p, self._n + 1,
                                 self._n + 3) * gate
+        fx, fy, fw, fh = field_text_rect(ground)
         self._other.setFrame_(
-            NSMakeRect(ox, oy - content_offset(field_a), ow, oh))
+            NSMakeRect(fx, fy - content_offset(field_a), fw, fh))
         self._other.setAlphaValue_(field_a)
         self._other.setEditable_(self._view.interactive)
 
