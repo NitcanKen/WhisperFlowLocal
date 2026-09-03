@@ -324,11 +324,24 @@ def test_context_mods_excludes_the_pressed_keys_own_modifier():
     assert context_mods({"cmd"}, D) == frozenset({"cmd"})
 
 
-def test_hold_matches_is_exclusive_between_bare_and_modified():
+def test_hold_matches_is_subset_based_not_equality_based():
+    # Requiring equality made any stray modifier silently kill the hotkey.
+    # The empty (dictate) spec therefore matches anything; disambiguation is
+    # the most-specific-first ordering in _build_holds, not the predicate.
     bare, modified = (frozenset(), keyboard.Key.alt_r), ({"shift"}, keyboard.Key.alt_r)
-    for held in ({"alt"}, {"alt", "shift"}):
-        got = [hold_matches(held, keyboard.Key.alt_r, m, k) for m, k in (bare, modified)]
-        assert got.count(True) == 1, held
+    assert hold_matches({"alt"}, keyboard.Key.alt_r, *bare)
+    assert not hold_matches({"alt"}, keyboard.Key.alt_r, *modified)
+    assert hold_matches({"alt", "shift"}, keyboard.Key.alt_r, *modified)
+    assert hold_matches({"alt", "shift"}, keyboard.Key.alt_r, *bare)
+    # a stray extra modifier must not stop the generation binding matching
+    assert hold_matches({"alt", "shift", "cmd"}, keyboard.Key.alt_r, *modified)
+
+
+def test_generate_wins_over_dictate_when_both_match():
+    mgr, counts = make_mgr()
+    mgr._on_press(keyboard.Key.shift)
+    mgr._on_press(keyboard.Key.alt_r)
+    assert counts["down"] == ["generate"]
 
 
 def test_hold_matches_ignores_a_different_key():
@@ -388,14 +401,14 @@ def test_shift_pressed_after_the_ptt_key_does_not_switch_mode():
     assert counts["down"] == ["dictate"] and counts["up"] == ["dictate"]
 
 
-def test_an_unrelated_modifier_blocks_the_hold():
-    # Strictness is deliberate: it is what makes the two bindings provably
-    # disjoint. Cmd+Right-Option used to start dictation; now it does nothing.
+def test_an_unrelated_modifier_still_dictates():
+    # Cmd+Right-Option dictated before this feature existed and still does:
+    # a stray held modifier must never make push-to-talk look broken.
     mgr, counts = make_mgr()
     mgr._on_press(keyboard.Key.cmd)
     mgr._on_press(keyboard.Key.alt_r)
     mgr._on_release(keyboard.Key.alt_r)
-    assert counts["down"] == [] and counts["up"] == []
+    assert counts["down"] == ["dictate"] and counts["up"] == ["dictate"]
 
 
 def test_generation_hold_suppresses_auto_repeat():
@@ -418,16 +431,16 @@ def test_only_one_hold_session_at_a_time():
     assert counts["up"] == ["dictate"]
 
 
-def test_empty_generate_combo_disables_generation_but_keeps_dictation():
+def test_empty_generate_combo_falls_back_to_dictation():
     mgr, counts = make_mgr(gen="")
     mgr._on_press(keyboard.Key.shift)
     mgr._on_press(keyboard.Key.alt_r)
     mgr._on_release(keyboard.Key.alt_r)
     mgr._on_release(keyboard.Key.shift)
-    assert counts["down"] == []
+    assert counts["down"] == ["dictate"]      # generation off, not dead keys
     mgr._on_press(keyboard.Key.alt_r)
     mgr._on_release(keyboard.Key.alt_r)
-    assert counts["down"] == ["dictate"]
+    assert counts["down"] == ["dictate", "dictate"]
 
 
 def test_generate_rebind_at_runtime_keeps_the_listener():

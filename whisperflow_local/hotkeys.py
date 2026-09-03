@@ -109,13 +109,20 @@ def context_mods(mods_held, key) -> frozenset:
 def hold_matches(mods_held, key, spec_mods, spec_key) -> bool:
     """True when pressing `key` with `mods_held` satisfies a held binding.
 
-    Plain push-to-talk is modelled as a hold binding with an EMPTY modifier
-    set, so push-to-talk and the generation combo are matched by the same
-    predicate and are mutually exclusive by construction — no priority rule.
+    The binding's modifiers must be a SUBSET of the context, not equal to it.
+    Requiring equality looks tidier but is brittle in the real world: any
+    stray modifier the OS reports (a key the user is still holding, a
+    remapper, a modifier whose release event the tap missed) would silently
+    match nothing at all and the hotkey would appear dead. Bindings are tried
+    most-specific-first, so matching stays deterministic:
+
+        shift + PTT      -> generate  (shift is held)
+        PTT alone        -> dictate   (empty spec, subset of anything)
+        cmd + PTT        -> dictate   (as before this feature existed)
     """
     if spec_key is None or not _keys_equal(key, spec_key):
         return False
-    return context_mods(mods_held, key) == frozenset(spec_mods or ())
+    return frozenset(spec_mods or ()) <= context_mods(mods_held, key)
 
 
 def parse_hold_combo(spec: str):
@@ -216,8 +223,12 @@ class HotkeyManager:
 
     @staticmethod
     def _build_holds(ptt_key_name: str, generate_combo: str) -> dict:
-        """Held bindings, generation first. Plain PTT is the empty-modifier
-        binding, so the two can never both match (see hold_matches)."""
+        """Held bindings, MOST SPECIFIC FIRST.
+
+        hold_matches is subset-based, so the empty-modifier `dictate` binding
+        matches anything `generate` does; the ordering is what disambiguates
+        them and is therefore load-bearing, not cosmetic.
+        """
         return {
             "generate": parse_hold_combo(generate_combo),
             "dictate": (frozenset(), resolve_key(ptt_key_name)),
@@ -242,6 +253,18 @@ class HotkeyManager:
                         self._hold_key, self._hold_mode = key, mode
                         down_mode = mode
                         break
+                else:
+                    # A press on a bound key that matched nothing is the
+                    # "my hotkey is dead" symptom — record why.
+                    if any(_keys_equal(key, k)
+                           for _, k in self._holds.values() if k is not None):
+                        log("hotkey", f"no hold matched {key!r} "
+                                      f"mods={sorted(self._mods_held)} "
+                                      f"ctx={sorted(context_mods(self._mods_held, key))}")
+            elif _keys_equal(key, self._hold_key):
+                pass                        # auto-repeat, expected
+            else:
+                log("hotkey", f"{key!r} ignored: {self._hold_mode} hold in flight")
             fire_toggle = False
             if (self._combo_trigger is not None
                     and _keys_equal(key, self._combo_trigger)
