@@ -134,7 +134,7 @@ def test_connect_failure_raises_unavailable():
     b = VLLMBackend("http://127.0.0.1:1/v1", "m",
                     connect_timeout=0.5, ttft_timeout=0.5)
     with pytest.raises(LLMUnavailable):
-        b.format_text("hello world", "Clean")
+        b.format_text("hello world", "Structured")
 
 
 def test_ping_false_when_down():
@@ -142,7 +142,8 @@ def test_ping_false_when_down():
     assert b.ping() is False
 
 
-def test_raw_profile_bypasses_network():
-    # Unknown/Raw profile never touches the network — safe even with no server.
+def test_profile_without_a_prompt_bypasses_network():
+    # Verbatim has no PROFILES entry (it goes through propose_cleanup), so
+    # format_text short-circuits — safe even with no server.
     b = VLLMBackend("http://127.0.0.1:1/v1", "m", connect_timeout=0.5)
-    assert b.format_text("keep as is", "Raw") == "keep as is"
+    assert b.format_text("keep as is", "Verbatim") == "keep as is"

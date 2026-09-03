@@ -44,7 +44,7 @@ def test_format_text_injects_vocab_into_system_prompt():
         return "ok"
 
     client._chat = fake_chat
-    client.format_text("hello", "Clean", vocab=["WhisperFlow", "Ollama"])
+    client.format_text("hello", "Structured", vocab=["WhisperFlow", "Ollama"])
     assert "WhisperFlow, Ollama" in captured["system"]
     assert captured["user"] == "hello"
 
@@ -53,5 +53,5 @@ def test_format_text_without_vocab_keeps_prompt_clean():
     client = LLMClient("http://127.0.0.1:1", "test-model")
     captured = {}
     client._chat = lambda s, u: captured.setdefault("system", s) and "ok" or "ok"
-    client.format_text("hello", "Clean")
+    client.format_text("hello", "Structured")
     assert "preferred vocabulary" not in captured["system"]

@@ -43,6 +43,10 @@ of truth. "Done" = every acceptance criterion below is implemented for real and 
 ### A. Capture & hotkeys
 - A1 **Push-to-talk**: hold a global hotkey (default Right Option) to record; release to transcribe.
 - A2 **Hands-free toggle**: a second hotkey starts/stops recording without holding.
+- A2b **Generation hold**: `Shift` + the push-to-talk key records a *content-generation*
+  request instead (C4). Both are HELD bindings matched by one predicate on the modifier
+  *context* (the pressed key's own modifier family is excluded), so they are mutually
+  exclusive by construction. `fn` is NOT usable: pynput exposes no `fn` key on macOS.
 - A3 Hotkeys are **configurable** in Settings and persist across restarts.
 - A4 Live **input-level / recording indicator** while capturing.
 - AC: each mode records real audio and produces a real transcript inserted into the focused app.
@@ -55,24 +59,39 @@ of truth. "Done" = every acceptance criterion below is implemented for real and 
 - B4 Model files download on first run with **visible progress**; cached afterwards (fully offline).
 - AC: a real audio clip → real transcript printed (not asserted).
 
-### C. AI formatting & commands (LLM layer, toggleable)
-- C1 **Cleanup**: punctuation, capitalization, filler-word removal, keep code-switch verbatim.
-- C2 **Formatting profiles** (each a distinct system prompt): `Raw` (no LLM), `Clean`, `Email`,
-  `Message/Chat`, `Notes/Bullets`. User-selectable; default configurable.
+### C. AI formatting & generation (LLM layer, toggleable)
+- C1 **Cleanup**: punctuation repair, filler-word and stutter removal, ASR homophone
+  correction; code-switching kept verbatim.
+- C2 **Two formatting modes** (as of 2026-09-03), picked from the menu and never
+  overridden by anything else:
+  - `Verbatim` (原文口語) — keeps the spoken wording. The model rewrites the whole
+    utterance (an edit list cannot move a misplaced 。), but every rewrite must pass
+    `textproc.guard_verbatim`: the output's characters minus punctuation and case must
+    be a **subsequence** of the input's and keep ≥70% of them. That permits deleting
+    fillers and rewriting marks while making translation, reordering, 書面語 conversion
+    and summarising impossible. Homophone fixes travel as a separate edit list through
+    `textproc.apply_edits`. Both channels come back from ONE model call.
+  - `Structured` (書面結構化) — understands the utterance and re-emits it as structured
+    written Chinese: 口語→書面語, self-corrections resolved to the speaker's final
+    intent, grouped and numbered. Deliberately unguarded; it is a transformation.
 - C3 **Voice commands** parsed from speech and applied, not typed literally: new line, new
   paragraph, "scratch that"/"delete that" (drop last segment), "all caps", "send"/"press enter".
-- C4 **AI text commands** over the last dictation or current clipboard selection: "make this more
-  formal", "summarize", "translate to English", "translate to Cantonese".
-- AC: real qwen3.5:4b (thinking disabled) output shown for C1 and at least one C2 profile, one C3
-  command, one C4 command.
+- C4 **Content generation** (hold `Shift`+push-to-talk): the user speaks a *request* and the
+  model writes the content, which is pasted like a dictation. A vague request first gets a
+  **clarify panel** (≤2 questions, 2-3 options each plus free text) at the waveform pill's
+  anchor, answered by click or by pressing 1-3, Esc to cancel. The panel is a nonactivating
+  NSPanel that becomes key WITHOUT activating the app, so the paste target is preserved.
+- AC: real GB10 output shown for both C2 modes, one C3 command, and both C4 paths
+  (clear request → written directly; vague request → clarified, then written).
 
 ### D. Personalization
 - D1 **Custom dictionary**: user word/replacement list (names, jargon, spellings) applied as
   post-processing and/or prompt hints; editable in Settings.
-- D2 **Per-app context**: detect the frontmost app (AppKit `NSWorkspace`) and auto-select a
-  formatting profile via user-editable rules (e.g. Mail→Email, Messages/Slack→Chat, Terminal/VS Code→Raw).
+- D2 **(removed 2026-09-03)** Per-app formatting rules. They silently overrode the mode the
+  user had ticked in the menu, which is the opposite of the intended contract: the menu
+  choice is authoritative. `Config.load` migrates old `app_rules` away.
 - D3 All personalization persists in config.
-- AC: a dictionary replacement demonstrably changes output; a per-app rule demonstrably switches profile.
+- AC: a dictionary replacement demonstrably changes output.
 
 ### E. Text injection
 - E1 Insert transcript into the focused app via clipboard + synthesized Cmd+V, then **restore the
@@ -88,8 +107,8 @@ of truth. "Done" = every acceptance criterion below is implemented for real and 
 
 ### G. Menu-bar UX, settings, onboarding
 - G1 Menu-bar **status icon** reflects state: idle / recording / transcribing / formatting / error.
-- G2 **Settings** UI (menu or window): hotkeys, ASR language, LLM on/off + model, default profile,
-  dictionary editor, per-app rules, copy-only toggle, launch-at-login.
+- G2 **Settings** UI (menu or window): hotkeys, ASR language, LLM on/off + model, formatting
+  mode (2 options), dictionary editor, copy-only toggle, launch-at-login.
 - G3 **Onboarding / first run**: guide the user to grant Microphone + Accessibility + Input
   Monitoring; show model-download progress.
 - G4 **Feedback**: start/stop cue (sound or HUD) and a completion/error notification.
@@ -111,8 +130,10 @@ of truth. "Done" = every acceptance criterion below is implemented for real and 
 ### J. Testing & verification
 - J1 Real **end-to-end** script: real audio → real SenseVoiceSmall transcript →
   real GB10 Qwen3.8 cleanup → printed output.
-- J2 Automated tests for: voice-command parsing (C3), dictionary replacement (D1), per-app profile
-  selection (D2), history storage (F1), tag-stripping (B1). All pass, output shown.
+- J2 Automated tests for: voice-command parsing (C3), dictionary replacement (D1), the
+  Verbatim rewrite guard (C2 — accepts filler/punctuation edits, rejects translation,
+  reordering, insertion and summarising), clarify parsing + the worker/main handoff (C4),
+  hold-binding exclusivity (A2b), history storage (F1), tag-stripping (B1). All pass.
 - J3 No-mocks grep (Principle 0) run and shown clean.
 - J4 A **self-audit checklist** mapping every criterion A1…I3 to its implementing module + test,
   printed at the end.

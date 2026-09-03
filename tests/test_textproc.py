@@ -1,8 +1,7 @@
-"""Unit tests for tag stripping, dictionary, voice commands, profile rules."""
+"""Unit tests for tag stripping, dictionary and voice commands."""
 from whisperflow_local.textproc import (
     apply_dictionary,
     parse_voice_commands,
-    pick_profile,
     strip_sensevoice_tags,
 )
 
@@ -91,29 +90,3 @@ def test_plain_text_untouched():
     p = parse_voice_commands("今日開會 we should sync about the roadmap")
     assert p.text == "今日開會 we should sync about the roadmap"
     assert not p.press_enter and not p.scratch
-
-
-# ------------------------------------------------------------ profile rules (D2)
-
-RULES = {"Mail": "Email", "Messages": "Message", "Term": "Raw", "iTerm": "Raw",
-         "Code": "Raw", "Slack": "Message"}
-
-
-def test_rule_match_simple():
-    assert pick_profile("Mail", RULES, "Clean") == "Email"
-    assert pick_profile("Slack", RULES, "Clean") == "Message"
-
-
-def test_rule_match_substring_case_insensitive():
-    assert pick_profile("Visual Studio Code", RULES, "Clean") == "Raw"
-    assert pick_profile("iterm2", RULES, "Clean") == "Raw"
-
-
-def test_rule_longest_key_wins():
-    # 'iTerm' (5 chars) must beat 'Term' (4 chars) for iTerm2.
-    assert pick_profile("iTerm2", RULES, "Clean") == RULES["iTerm"]
-
-
-def test_rule_no_match_uses_default():
-    assert pick_profile("Safari", RULES, "Clean") == "Clean"
-    assert pick_profile("", RULES, "Notes") == "Notes"

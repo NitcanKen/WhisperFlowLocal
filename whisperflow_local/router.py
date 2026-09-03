@@ -1,7 +1,7 @@
 """LLM backend router with remote-only and legacy fallback modes.
 
-Exposes the same interface as a single backend (`format_text`, `propose_edits`,
-`run_command`, `ping`, `.model`) so callers are unchanged.
+Exposes the same interface as a single backend (`format_text`, `propose_cleanup`,
+`ping`, `.model`) so callers are unchanged.
 
 Modes (config `llm_backend`):
 - "remote": every call goes to vLLM. Failures propagate to the app's
@@ -15,8 +15,8 @@ Modes (config `llm_backend`):
   `cooldown` seconds it re-probes the remote on the next call and, on success,
   switches back.
 
-Only `LLMUnavailable` triggers fallback — a `ValueError` (unknown AI command)
-or other bug propagates unchanged.
+Only `LLMUnavailable` triggers fallback — any other exception is a bug and
+propagates unchanged.
 
 The remote-primary + cooldown state lives in a shared `CircuitBreaker`
 (`breaker.py`), which `ASRRouter` also composes.
@@ -42,11 +42,15 @@ class LLMRouter:
     def format_text(self, text, profile, vocab=None):
         return self._dispatch("format_text", text, profile, vocab=vocab)
 
-    def propose_edits(self, text, vocab=None):
-        return self._dispatch("propose_edits", text, vocab=vocab)
+    def propose_cleanup(self, text, vocab=None):
+        return self._dispatch("propose_cleanup", text, vocab=vocab)
 
-    def run_command(self, command, text):
-        return self._dispatch("run_command", command, text)
+    def plan_generation(self, request, vocab=None):
+        return self._dispatch("plan_generation", request, vocab=vocab)
+
+    def generate(self, request, questions=None, answers=None, vocab=None):
+        return self._dispatch("generate", request, questions=questions,
+                              answers=answers, vocab=vocab)
 
     def ping(self):
         if self.backend == "remote":

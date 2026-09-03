@@ -24,11 +24,15 @@ class FakeBackend:
     def format_text(self, text, profile, vocab=None):
         return self._run()
 
-    def propose_edits(self, text, vocab=None):
+    def propose_cleanup(self, text, vocab=None):
+        self._run()
+        return {"clean": "", "edits": []}
+
+    def plan_generation(self, request, vocab=None):
         self._run()
         return []
 
-    def run_command(self, command, text):
+    def generate(self, request, questions=None, answers=None, vocab=None):
         return self._run()
 
     def ping(self):
@@ -59,7 +63,7 @@ def make(local_healthy=True, remote_healthy=True, backend="auto",
 
 def test_remote_used_when_healthy():
     router, local, remote, _ = make()
-    assert router.format_text("hi", "Clean") == "REMOTE"
+    assert router.format_text("hi", "Verbatim") == "REMOTE"
     assert remote.calls == 1 and local.calls == 0
     assert router.model == "remote-35b"
 
@@ -67,7 +71,7 @@ def test_remote_used_when_healthy():
 def test_remote_only_never_calls_local_or_falls_back():
     router, local, remote, _ = make(remote_healthy=False, backend="remote")
     try:
-        router.format_text("hi", "Clean")
+        router.format_text("hi", "Verbatim")
     except LLMUnavailable:
         pass
     else:
@@ -80,40 +84,40 @@ def test_remote_only_never_calls_local_or_falls_back():
 def test_remote_only_does_not_require_a_local_backend():
     remote = FakeBackend("gb10-qwen38", reply="REMOTE")
     router = LLMRouter(local=None, remote=remote, backend="remote")
-    assert router.format_text("hi", "Clean") == "REMOTE"
+    assert router.format_text("hi", "Verbatim") == "REMOTE"
     assert router.ping() is True
     assert router.model == "gb10-qwen38"
 
 
 def test_fallback_on_remote_failure():
     router, local, remote, _ = make(remote_healthy=False)
-    assert router.format_text("hi", "Clean") == "LOCAL"
+    assert router.format_text("hi", "Verbatim") == "LOCAL"
     assert remote.calls == 1 and local.calls == 1
     assert router.model == "local-4b"
 
 
 def test_success_resets_consecutive_counter():
     router, local, remote, _ = make(remote_healthy=False, threshold=3)
-    router.format_text("a", "Clean")   # fail 1
-    router.format_text("b", "Clean")   # fail 2
+    router.format_text("a", "Verbatim")   # fail 1
+    router.format_text("b", "Verbatim")   # fail 2
     remote.healthy = True
-    assert router.format_text("c", "Clean") == "REMOTE"  # success -> reset
+    assert router.format_text("c", "Verbatim") == "REMOTE"  # success -> reset
     remote.healthy = False
-    router.format_text("d", "Clean")   # fail 1 (not 3)
-    router.format_text("e", "Clean")   # fail 2
+    router.format_text("d", "Verbatim")   # fail 1 (not 3)
+    router.format_text("e", "Verbatim")   # fail 2
     before = remote.calls
-    router.format_text("f", "Clean")   # fail 3 -> trips on this call
-    router.format_text("g", "Clean")   # tripped: no remote attempt
+    router.format_text("f", "Verbatim")   # fail 3 -> trips on this call
+    router.format_text("g", "Verbatim")   # tripped: no remote attempt
     assert remote.calls == before + 1
 
 
 def test_breaker_trips_after_threshold_then_skips_remote():
     router, local, remote, _ = make(remote_healthy=False, threshold=3)
     for _ in range(3):
-        router.format_text("x", "Clean")
+        router.format_text("x", "Verbatim")
     assert remote.calls == 3
-    router.format_text("x", "Clean")   # tripped -> straight to local
-    router.format_text("x", "Clean")
+    router.format_text("x", "Verbatim")   # tripped -> straight to local
+    router.format_text("x", "Verbatim")
     assert remote.calls == 3
     assert local.calls == 5
 
@@ -122,17 +126,17 @@ def test_cooldown_reprobes_and_recovers():
     router, local, remote, clock = make(remote_healthy=False, threshold=3,
                                         cooldown=300.0)
     for _ in range(3):
-        router.format_text("x", "Clean")  # trip
+        router.format_text("x", "Verbatim")  # trip
     assert remote.calls == 3
     clock.advance(299)
-    router.format_text("x", "Clean")      # still cooling: no probe
+    router.format_text("x", "Verbatim")      # still cooling: no probe
     assert remote.calls == 3
     clock.advance(2)
     remote.healthy = True
-    assert router.format_text("x", "Clean") == "REMOTE"  # probe -> recover
+    assert router.format_text("x", "Verbatim") == "REMOTE"  # probe -> recover
     assert remote.calls == 4
     assert router.model == "remote-35b"
-    router.format_text("x", "Clean")      # normal: remote directly
+    router.format_text("x", "Verbatim")      # normal: remote directly
     assert remote.calls == 5
 
 
@@ -140,19 +144,20 @@ def test_probe_failure_restays_local_and_rearms_cooldown():
     router, local, remote, clock = make(remote_healthy=False, threshold=3,
                                         cooldown=300.0)
     for _ in range(3):
-        router.format_text("x", "Clean")  # trip
+        router.format_text("x", "Verbatim")  # trip
     clock.advance(301)
-    router.format_text("x", "Clean")      # probe -> fails
+    router.format_text("x", "Verbatim")      # probe -> fails
     assert remote.calls == 4
-    router.format_text("x", "Clean")      # cooldown re-armed: no probe
+    router.format_text("x", "Verbatim")      # cooldown re-armed: no probe
     assert remote.calls == 4
 
 
 def test_local_pinned_never_calls_remote():
     router, local, remote, _ = make(backend="local")
-    assert router.format_text("hi", "Clean") == "LOCAL"
-    router.propose_edits("hi")
-    router.run_command("Summarize", "hi")
+    assert router.format_text("hi", "Verbatim") == "LOCAL"
+    router.propose_cleanup("hi")
+    router.plan_generation("hi")
+    router.generate("hi")
     assert remote.calls == 0
     assert router.model == "local-4b"
 
@@ -160,11 +165,11 @@ def test_local_pinned_never_calls_remote():
 def test_set_backend_local_then_auto_resets_breaker():
     router, local, remote, _ = make(remote_healthy=False, threshold=3)
     for _ in range(3):
-        router.format_text("x", "Clean")  # trip
+        router.format_text("x", "Verbatim")  # trip
     router.set_backend("local")
     router.set_backend("auto")            # reset breaker
     remote.healthy = True
-    assert router.format_text("x", "Clean") == "REMOTE"
+    assert router.format_text("x", "Verbatim") == "REMOTE"
     assert remote.calls == 4              # tried remote right after reset
 
 
@@ -174,9 +179,9 @@ def test_notify_fires_on_trip_and_reconnect():
         remote_healthy=False, threshold=3, cooldown=300.0,
         notify=lambda ev, m: events.append((ev, m)))
     for _ in range(3):
-        router.format_text("x", "Clean")  # trip -> "fallback"
+        router.format_text("x", "Verbatim")  # trip -> "fallback"
     assert events == [("fallback", "local-4b")]
     clock.advance(301)
     remote.healthy = True
-    router.format_text("x", "Clean")      # probe succeeds -> "reconnected"
+    router.format_text("x", "Verbatim")      # probe succeeds -> "reconnected"
     assert events == [("fallback", "local-4b"), ("reconnected", "remote-35b")]

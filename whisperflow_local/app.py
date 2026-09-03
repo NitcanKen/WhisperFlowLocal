@@ -20,14 +20,15 @@ from .applog import log
 from .asr import RemoteQwenASRBackend, SenseVoiceEngine
 from .asr_router import ASRRouter
 from .audio import Recorder, duration_seconds, save_wav
+from .clarify import CLARIFY_TIMEOUT, ClarifyPanel, ClarifyRequest
 from .config import Config
 from .frontmost import frontmost_app_name
 from .history import History
-from .hotkeys import HotkeyManager
+from .hotkeys import HotkeyManager, retarget_hold
 from .i18n import set_language, tr
 from .keycap import KeyCapturePanel, pretty_combo, pretty_key
 from .injector import copy_to_clipboard, delete_chars, insert, press_enter
-from .llm import AI_COMMANDS, LLMUnavailable, PROFILES, VLLMBackend
+from .llm import LLMUnavailable, PROFILES, VLLMBackend
 from .overlay import WaveformOverlay
 from .router import LLMRouter
 from .sounds import play
@@ -35,9 +36,9 @@ from .textproc import (
     apply_dictionary,
     apply_edits,
     apply_phonetic_hotwords,
+    guard_verbatim,
     parse_vocab_entry,
     parse_voice_commands,
-    pick_profile,
     quick_clean,
     should_use_llm,
     strip_punctuation,
@@ -46,7 +47,7 @@ from .textproc import (
 )
 
 LANG_CODES = ["auto", "yue", "en", "mixed"]
-PROFILE_NAMES = ["Raw"] + list(PROFILES.keys())
+PROFILE_NAMES = ["Verbatim", "Structured"]
 UI_LANGS = [("auto", "Auto (跟隨系統)"), ("en", "English"), ("zh-HK", "廣東話 zh-HK")]
 LEVEL_BARS = "▁▂▃▄▅▆▇█"
 
@@ -89,6 +90,12 @@ class WhisperFlowApp(rumps.App):
         self._jobs = queue.Queue()
         self.overlay = WaveformOverlay()
         self.keycap = KeyCapturePanel()
+        self.clarify = ClarifyPanel()
+        # Worker -> main handoff for the clarify round (same dirty-flag
+        # pattern as _llm_switch_note/_llm_switch_dirty above).
+        self._clarify_req = None
+        self._clarify_dirty = False
+        self._session_mode = "dictate"
         self._capture_session = None
         self._capture_kind = None
         self._capture_deadline = 0.0
@@ -115,6 +122,7 @@ class WhisperFlowApp(rumps.App):
         self.hotkeys = HotkeyManager(
             self.config.get("ptt_key"),
             self.config.get("toggle_hotkey"),
+            self.config.get("generate_hotkey"),
             on_ptt_down=self._begin_recording,
             on_ptt_up=self._end_recording,
             on_toggle=self._toggle_recording,
@@ -193,17 +201,6 @@ class WhisperFlowApp(rumps.App):
             self._backend_items[code] = item
             self.menu_model.add(item)
 
-        self.menu_ai = rumps.MenuItem(tr("menu_ai"))
-        self._cmd_items = {}
-        for cmd in AI_COMMANDS:
-            item = rumps.MenuItem(tr(f"cmd_{cmd}"), callback=self._ai_command)
-            item._cmd_key = cmd
-            self._cmd_items[cmd] = item
-            self.menu_ai.add(item)
-        self.menu_ai.add(rumps.separator)
-        self.menu_ai.add(rumps.MenuItem(tr("menu_ai_clipboard"),
-                                        callback=self._ai_on_clipboard))
-
         self.menu_history = rumps.MenuItem(tr("menu_history"))
         seed = rumps.MenuItem(tr("menu_history_empty"))
         seed.set_callback(None)
@@ -220,8 +217,6 @@ class WhisperFlowApp(rumps.App):
         self.menu_vocab.add(seed)
         self._vocab_dirty = True
         self.menu_settings.add(self.menu_vocab)
-        self.menu_settings.add(rumps.MenuItem(tr("menu_edit_rules"),
-                                              callback=self._edit_app_rules))
         self.item_copy_only = rumps.MenuItem(tr("menu_copy_only"),
                                              callback=self._toggle_copy_only)
         self.menu_settings.add(self.item_copy_only)
@@ -256,7 +251,6 @@ class WhisperFlowApp(rumps.App):
             self.menu_engine,
             self.item_llm,
             self.menu_model,
-            self.menu_ai,
             self.menu_history,
             None,
             self.menu_settings,
@@ -308,6 +302,7 @@ class WhisperFlowApp(rumps.App):
         # Smooth HUD first — it wants every tick.
         self.overlay.tick(self.state, self.recorder.level)
         self._poll_capture()
+        self._poll_clarify()
 
         if self.state == "recording":
             bar = LEVEL_BARS[min(len(LEVEL_BARS) - 1,
@@ -316,7 +311,8 @@ class WhisperFlowApp(rumps.App):
         else:
             new_title = {
                 "loading": "⏳", "idle": "🎤", "transcribing": "✍️",
-                "formatting": "✨", "error": "⚠️",
+                "formatting": "✨", "generating": "✨", "clarifying": "❓",
+                "error": "⚠️",
             }.get(self.state, "🎤")
         # Only touch NSStatusItem/menu when something actually changed.
         if new_title != self._shown_title:
@@ -332,6 +328,9 @@ class WhisperFlowApp(rumps.App):
         if self._vocab_dirty:
             self._vocab_dirty = False
             self._rebuild_vocab_menu()
+        if self._clarify_dirty:
+            self._clarify_dirty = False
+            self._show_clarify(self._clarify_req)
         if self._llm_switch_dirty:
             self._llm_switch_dirty = False
             self._apply_llm_switch(*self._llm_switch_note)
@@ -362,13 +361,15 @@ class WhisperFlowApp(rumps.App):
                                              callback=self._clear_history))
 
     # ------------------------------------------------------------ recording
-    def _begin_recording(self):
-        if self.state in ("recording",):
+    def _begin_recording(self, mode: str = "dictate"):
+        if self.state in ("recording", "clarifying"):
             return
         try:
             self.recorder.start()
+            self._session_mode = mode
             self.state = "recording"
-            self.state_msg = tr("status_recording")
+            self.state_msg = tr("status_recording_gen" if mode == "generate"
+                                else "status_recording")
             play("start", self.config.get("sounds"))
         except Exception as exc:
             self.state = "error"
@@ -376,7 +377,7 @@ class WhisperFlowApp(rumps.App):
             play("error", self.config.get("sounds"))
             _notify(tr("notify_mic_title"), tr("notify_mic_body"))
 
-    def _end_recording(self):
+    def _end_recording(self, mode: str = "dictate"):
         if self.state != "recording":
             return
         audio = self.recorder.stop()
@@ -387,13 +388,16 @@ class WhisperFlowApp(rumps.App):
             return
         self.state = "transcribing"
         self.state_msg = tr("status_transcribing")
-        self._jobs.put(("transcribe", audio))
+        # Generation is a different pipeline (ASR -> LLM writes the text ->
+        # paste); it must not re-enter the formatting-profile logic.
+        self._jobs.put(("generate" if mode == "generate" else "transcribe", audio))
 
     def _toggle_recording(self):
+        # The hands-free hotkey and the menu item always dictate.
         if self.state == "recording":
-            self._end_recording()
+            self._end_recording("dictate")
         else:
-            self._begin_recording()
+            self._begin_recording("dictate")
 
     def _menu_toggle(self, _):
         self._toggle_recording()
@@ -418,8 +422,8 @@ class WhisperFlowApp(rumps.App):
             try:
                 if kind == "transcribe":
                     self._process_audio(payload)
-                elif kind == "ai_command":
-                    self._process_ai_command(*payload)
+                elif kind == "generate":
+                    self._process_generation(payload)
             except Exception as exc:
                 self.state = "error"
                 self.state_msg = f"{tr('notify_pipeline_err')}: {exc}"
@@ -452,29 +456,31 @@ class WhisperFlowApp(rumps.App):
             self.state = "idle"
             return
 
-        app_name = frontmost_app_name()
-        profile = pick_profile(
-            app_name, self.config.get("app_rules"), self.config.get("profile")
-        )
+        app_name = frontmost_app_name()  # recorded in history only
+        profile = self.config.get("profile")
 
         formatted = parsed.text
         hk = self.config.get("traditional_hk")
-        if should_use_llm(self.config.get("llm_enabled"), profile, parsed.text):
+        if should_use_llm(self.config.get("llm_enabled"), parsed.text):
             self.state = "formatting"
             self.state_msg = f"{tr('status_formatting')} ({profile})…"
             try:
-                if profile == "Clean":
-                    # Guarded edit list, not a rewrite: qwen3.5:4b corrupts
-                    # Cantonese when asked to regenerate whole sentences.
+                if profile == "Verbatim":
                     vocab = self._vocab_list()
                     base = quick_clean(parsed.text, vocab=vocab, hk=hk)
                     # Deterministic hot-word recovery first (SenseVoice has no
                     # model-level biasing), then the LLM for general homophones.
                     base = apply_phonetic_hotwords(base, vocab)
-                    edits = self.llm.propose_edits(base, vocab=vocab)
-                    formatted = apply_edits(base, edits, vocab=vocab)
-                    log("route", f"llm edits ({self.llm.model}): "
-                                 f"{edits if edits else 'none'}")
+                    # One call, two channels: a whole-utterance repunctuation
+                    # (accepted only if guard_verbatim proves it merely deleted
+                    # characters and changed marks) plus a homophone edit list.
+                    out = self.llm.propose_cleanup(base, vocab=vocab)
+                    guarded = guard_verbatim(base, out["clean"])
+                    if out["clean"] and guarded is base:
+                        log("route", "verbatim rewrite REJECTED by guard")
+                    formatted = apply_edits(guarded, out["edits"], vocab=vocab)
+                    log("route", f"llm cleanup ({self.llm.model}): "
+                                 f"{out['edits'] if out['edits'] else 'no edits'}")
                 else:
                     formatted = self.llm.format_text(parsed.text, profile,
                                                      vocab=self._vocab_list())
@@ -488,7 +494,7 @@ class WhisperFlowApp(rumps.App):
                 log("route", f"quick_clean + hotwords fallback — {exc}")
                 self.state_msg = tr("status_llm_off_raw", err=exc)
                 _notify(tr("notify_llm_unavailable_title"), str(exc))
-        elif profile != "Raw" and parsed.text:
+        elif parsed.text:
             # LLM toggled off: deterministic cleanup + hot-word recovery so
             # 繁體/spacing and known-term homophones still get fixed offline.
             formatted = apply_phonetic_hotwords(
@@ -496,7 +502,10 @@ class WhisperFlowApp(rumps.App):
                 self._vocab_list())
             log("route", "quick_clean + hotwords (LLM disabled)")
 
-        if not self.config.get("punctuation") and formatted:
+        # Structured's punctuation IS its structure — stripping it would
+        # destroy the headings and numbered lists, so the toggle is Verbatim-only.
+        if (not self.config.get("punctuation") and formatted
+                and profile == "Verbatim"):
             formatted = strip_punctuation(formatted)
 
         if formatted:
@@ -519,25 +528,160 @@ class WhisperFlowApp(rumps.App):
         if self.state != "error":
             self.state = "idle"
 
-    def _process_ai_command(self, command, source_text):
-        self.state = "formatting"
-        self.state_msg = f"AI: {tr(f'cmd_{command}')}…"
+    def _process_generation(self, audio):
+        """Content-generation pipeline: ASR captures the REQUEST, the LLM
+        writes the content, and the result is pasted like a dictation.
+
+        Unlike _process_audio there is no deterministic degradation: without
+        the LLM there is nothing to paste, so a failure reports and inserts
+        NOTHING rather than pasting the user's own request into their app.
+        """
+        wav = save_wav(audio, paths.AUDIO_TMP)
+        log("audio", f"{duration_seconds(audio):.1f}s captured (generate)")
+        raw = self.asr.transcribe(wav, self.config.get("language"),
+                                  context=self._vocab_list())
+        log("asr", f"({self.asr.engine_name}) request: "
+                   + (raw if raw.strip() else "(empty)"))
+        if not raw.strip():
+            self.state = "idle"
+            self.state_msg = tr("status_heard_nothing")
+            return
+
+        request = parse_voice_commands(
+            apply_dictionary(raw, self.config.get("dictionary"))).text
+        if not request:
+            self.state = "idle"
+            self.state_msg = tr("status_heard_nothing")
+            return
+
+        app_name = frontmost_app_name()
+        vocab = self._vocab_list()
+        self.state = "generating"
+        self.state_msg = tr("status_generating")
         try:
-            out = self.llm.run_command(command, source_text)
+            questions = self.llm.plan_generation(request, vocab=vocab)
+            answers = []
+            if questions:
+                answers = self._ask_clarify(questions)
+                if answers is None:          # cancelled or timed out
+                    self.state = "idle"
+                    self.state_msg = tr("status_gen_cancelled")
+                    return
+                self.state = "generating"
+                self.state_msg = tr("status_generating")
+            out = self.llm.generate(request, questions=questions,
+                                    answers=answers, vocab=vocab)
         except LLMUnavailable as exc:
             self.state = "error"
-            self.state_msg = str(exc)
+            self.state_msg = tr("status_gen_failed", err=exc)
             play("error", self.config.get("sounds"))
             _notify(tr("notify_llm_unavailable_title"), str(exc))
             return
-        copy_to_clipboard(out)
+
+        if self.config.get("traditional_hk"):
+            out = to_hk(out)
+        if not out.strip():
+            self.state = "error"
+            self.state_msg = tr("status_gen_empty")
+            play("error", self.config.get("sounds"))
+            return
+
+        path = insert(out, copy_only=self.config.get("copy_only"))
+        log("insert", f"path={path} generated={out[:60]!r}")
+        self._last_inserted = out
+        self._last_insert_path = path
         self._last_formatted = out
-        self.history.add(source_text, out, frontmost_app_name(), f"AI:{command}")
+        self.history.add(request, out, app_name, "Generate")
         self._history_dirty = True
-        self.state = "idle"
-        self.state_msg = f"{tr('status_ai_copied')} {out[:40]}"
+        shown = out.replace("\n", " ")[:48]
+        if path == "clipboard-no-perm":
+            self.state_msg = tr("status_copied_no_perm")
+            _notify(tr("notify_copied_title"), tr("notify_copied_body"))
+        else:
+            self.state_msg = f"{tr('status_inserted_via')} ({path}): {shown}"
         play("done", self.config.get("sounds"))
-        _notify(tr(f"cmd_{command}"), out[:120])
+        if self.state != "error":
+            self.state = "idle"
+
+    def _ask_clarify(self, questions):
+        """Worker thread: put the questions on screen and wait for answers.
+
+        Returns the answer list, or None when the user cancelled. Blocking
+        here is safe and intended — this is the worker thread, so the AppKit
+        main thread keeps rendering the HUD and the menu throughout.
+        """
+        req = ClarifyRequest(questions)
+        self.state = "clarifying"
+        self.state_msg = tr("status_clarifying")
+        self._clarify_req = req              # publish before flagging, so the
+        self._clarify_dirty = True           # reader never sees a stale slot
+        # Backstop in case the main-thread timer has died: the worker must
+        # never block forever, whatever happens to the UI.
+        if not req.done.wait(CLARIFY_TIMEOUT * len(questions) + 10.0):
+            req.resolve("timeout")
+        log("generate", f"clarify {req.state}: {req.answers}")
+        if req.state == "cancelled":
+            return None
+        return req.answers
+
+    # ------------------------------------------------------------- clarify
+    def _show_clarify(self, req):
+        """Main thread: display the current question."""
+        if req is None or req.done.is_set():
+            return
+        q = req.questions[req.index]
+        req.state = "shown"
+        req.extend_deadline()
+        # The panel takes the keyboard, so stop holds/toggles firing beneath it.
+        self.hotkeys.set_suppressed(True)
+        try:
+            self.clarify.show(q["question"], q["options"], tr("clarify_hint"))
+        except Exception as exc:
+            log("clarify", f"panel show failed: {exc!r}")
+            self._finish_clarify(req, "cancelled")
+
+    def _poll_clarify(self):
+        """Main thread, ~30 Hz. Never blocks."""
+        req = self._clarify_req
+        if req is None or req.done.is_set():
+            return
+        try:
+            choice = self.clarify.take_choice()
+        except Exception as exc:
+            log("clarify", f"poll failed: {exc!r}")
+            self._finish_clarify(req, "cancelled")
+            return
+        if choice is None:
+            if req.expired():
+                # Timing out is not a cancel: generate with what we have
+                # rather than throwing the user's dictation away.
+                self._finish_clarify(req, "timeout", req.answers)
+            return
+        if choice == "cancel":
+            self._finish_clarify(req, "cancelled")
+            return
+        if choice.startswith("opt:"):
+            answer = req.questions[req.index]["options"][int(choice[4:])]
+        else:
+            answer = choice.split(":", 1)[1]
+        req.answers.append(answer)
+        req.index += 1
+        if req.index >= len(req.questions):
+            self._finish_clarify(req, "answered", req.answers)
+        else:
+            self._show_clarify(req)
+
+    def _finish_clarify(self, req, state, answers=None):
+        """The one place a clarify round ends. The ordering is load-bearing:
+        the panel must give up the keyboard BEFORE the worker resumes, or the
+        synthesized ⌘V would paste into our own panel."""
+        try:
+            self.clarify.hide()
+        except Exception as exc:
+            log("clarify", f"hide failed: {exc!r}")
+        self.hotkeys.set_suppressed(False)
+        self._clarify_req = None
+        req.resolve(state, answers)
 
     # ------------------------------------------------------------ callbacks
     def _set_profile(self, sender):
@@ -661,28 +805,6 @@ class WhisperFlowApp(rumps.App):
         launchagent.toggle()
         self._sync_checkmarks()
 
-    def _ai_command(self, sender):
-        source = self._last_formatted
-        if not source:
-            rumps.alert(APP_NAME, tr("dlg_no_dictation"))
-            return
-        self._jobs.put(("ai_command", (sender._cmd_key, source)))
-
-    def _ai_on_clipboard(self, _):
-        import pyperclip
-        source = pyperclip.paste()
-        if not source.strip():
-            rumps.alert(APP_NAME, tr("dlg_clipboard_empty"))
-            return
-        names = {tr(f"cmd_{c}"): c for c in AI_COMMANDS}
-        names.update({c: c for c in AI_COMMANDS})  # accept English too
-        resp = rumps.Window(
-            tr("dlg_which_command") + " / ".join(tr(f"cmd_{c}") for c in AI_COMMANDS),
-            APP_NAME, default_text=list(names)[0], dimensions=(260, 24),
-        ).run()
-        if resp.clicked and resp.text.strip() in names:
-            self._jobs.put(("ai_command", (names[resp.text.strip()], source)))
-
     def _reinsert(self, sender):
         insert(sender._entry_text, copy_only=self.config.get("copy_only"))
         self.state_msg = tr("status_reinserted")
@@ -745,11 +867,17 @@ class WhisperFlowApp(rumps.App):
         # on screen forever (the "pressed a key, no response" symptom).
         try:
             if self._capture_kind == "ptt":
-                self.hotkeys.update(result, self.config.get("toggle_hotkey"))
+                # Keep the generation combo pointing at the PTT key when it
+                # moves, or it would fire from a key that is no longer PTT.
+                gen = retarget_hold(self.config.get("generate_hotkey"),
+                                    self.config.get("ptt_key"), result)
+                self.hotkeys.update(result, self.config.get("toggle_hotkey"), gen)
                 self.config.set("ptt_key", result)
+                self.config.set("generate_hotkey", gen)
                 shown = pretty_key(result)
             else:
-                self.hotkeys.update(self.config.get("ptt_key"), result)
+                self.hotkeys.update(self.config.get("ptt_key"), result,
+                                    self.config.get("generate_hotkey"))
                 self.config.set("toggle_hotkey", result)
                 shown = pretty_combo(result)
             self.keycap.show_result(tr("cap_saved", key=shown))
@@ -820,22 +948,6 @@ class WhisperFlowApp(rumps.App):
             entries.pop(idx)
             self.config.set(key, entries)
         self._vocab_dirty = True
-
-    def _edit_app_rules(self, _):
-        current = json.dumps(self.config.get("app_rules"),
-                             ensure_ascii=False, indent=2)
-        resp = rumps.Window(
-            tr("dlg_rules_prompt", names=", ".join(PROFILE_NAMES)),
-            APP_NAME, default_text=current, dimensions=(420, 220),
-        ).run()
-        if resp.clicked:
-            try:
-                data = json.loads(resp.text)
-                assert isinstance(data, dict)
-            except (json.JSONDecodeError, AssertionError):
-                rumps.alert(APP_NAME, tr("dlg_invalid_json_rules"))
-                return
-            self.config.set("app_rules", data)
 
     def _open_config(self, _):
         subprocess.run(["open", paths.APP_SUPPORT], check=False)

@@ -26,6 +26,7 @@ from whisperflow_local.llm import (  # noqa: E402
 )
 from whisperflow_local.textproc import (  # noqa: E402
     apply_edits,
+    guard_verbatim,
     apply_phonetic_hotwords,
     quick_clean,
     vocab_terms,
@@ -60,13 +61,15 @@ def main():
         base = apply_phonetic_hotwords(
             quick_clean(SAMPLE, vocab=vocab, hk=hk), vocab)
         try:
-            edits = remote.propose_edits(base, vocab=vocab)
-            cleaned = apply_edits(base, edits, vocab=vocab)
-            email = remote.format_text(SAMPLE, "Email", vocab=vocab)
+            out = remote.propose_cleanup(base, vocab=vocab)
+            edits = out["edits"]
+            cleaned = apply_edits(guard_verbatim(base, out["clean"]),
+                                  edits, vocab=vocab)
+            email = remote.format_text(SAMPLE, "Structured", vocab=vocab)
             print(f"  input   : {SAMPLE}")
             print(f"  edits   : {edits if edits else 'none'}")
             print(f"  clean   : {cleaned}")
-            print(f"  email   : {email!r}  (long output, not cut at 1s TTFT)\n")
+            print(f"  struct  : {email!r}  (long output, not cut at 1s TTFT)\n")
         except LLMUnavailable as exc:
             print(f"  remote failed mid-call: {exc}\n")
 
@@ -76,7 +79,7 @@ def main():
                               connect_timeout=0.5, ttft_timeout=0.5)
     base = apply_phonetic_hotwords(quick_clean(SAMPLE, vocab=vocab, hk=hk), vocab)
     try:
-        dead_remote.propose_edits(base, vocab=vocab)
+        dead_remote.propose_cleanup(base, vocab=vocab)
     except LLMUnavailable as exc:
         print(f"  expected remote-only failure: {exc}")
         print(f"  deterministic output retained: {base}")

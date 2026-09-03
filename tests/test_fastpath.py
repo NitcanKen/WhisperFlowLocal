@@ -4,30 +4,26 @@ from whisperflow_local.textproc import quick_clean, should_use_llm, to_hk
 
 # ------------------------------------------------------------ routing
 
-def test_clean_profile_routes_to_llm_even_for_fluent_speech():
+def test_fluent_speech_still_routes_to_llm():
     # Regression: ASR homophone slips (影得→認得, 中影→中英) carry no
     # disfluency marker, so routing on disfluencies starved the LLM of
-    # exactly the text it exists to fix. Non-Raw profiles always route
-    # to the LLM when it is enabled (SPEC C2).
-    assert should_use_llm(True, "Clean", "幫我 send 個 email 俾 David")
-    assert should_use_llm(True, "Clean", "book a table for two at eight")
+    # exactly the text it exists to fix.
+    assert should_use_llm(True, "幫我 send 個 email 俾 David")
+    assert should_use_llm(True, "book a table for two at eight")
 
 
-def test_all_non_raw_profiles_use_llm():
-    for profile in ("Clean", "Email", "Message", "Notes"):
-        assert should_use_llm(True, profile, "今晚八點食飯")
-
-
-def test_raw_profile_never_uses_llm():
-    assert not should_use_llm(True, "Raw", "keep exactly as spoken")
+def test_every_non_empty_utterance_uses_llm():
+    # Raw is gone: both surviving profiles need the model, so routing no
+    # longer depends on the profile at all.
+    assert should_use_llm(True, "今晚八點食飯")
 
 
 def test_llm_disabled_skips_llm():
-    assert not should_use_llm(False, "Clean", "幫我 send 個 email")
+    assert not should_use_llm(False, "幫我 send 個 email")
 
 
 def test_empty_text_skips_llm():
-    assert not should_use_llm(True, "Clean", "   ")
+    assert not should_use_llm(True, "   ")
 
 
 # ------------------------------------------------------------ quick_clean

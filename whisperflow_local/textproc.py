@@ -67,19 +67,23 @@ def apply_dictionary(text: str, entries: list) -> str:
 
 
 # ------------------------------------------------- LLM routing + cleanup
-# Non-Raw profiles always route to the LLM when it is enabled: ASR errors
-# (Cantonese homophone slips, misheard English terms) carry no surface
-# marker a regex can detect — only the LLM can judge them from context.
-# quick_clean is the deterministic degradation path when the LLM is
-# disabled or Ollama is unreachable, not a routing choice.
+# Every utterance routes to the LLM when it is enabled: ASR errors
+# (Cantonese homophone slips, misheard English terms) and misplaced ITN
+# punctuation carry no surface marker a regex can detect — only the LLM
+# can judge them from context. quick_clean is the deterministic
+# degradation path when the LLM is disabled or unreachable.
 
 _CJK = r"一-鿿"
 _CC_S2HK = None
 
 
-def should_use_llm(llm_enabled: bool, profile: str, text: str) -> bool:
-    """Route every non-empty, non-Raw utterance to the LLM when enabled."""
-    return bool(llm_enabled and profile != "Raw" and text and text.strip())
+def should_use_llm(llm_enabled: bool, text: str) -> bool:
+    """Route every non-empty utterance to the LLM when it is enabled.
+
+    Both surviving profiles need the model: Verbatim for punctuation repair
+    and filler removal, Structured for the rewrite. There is no longer a
+    profile that bypasses it."""
+    return bool(llm_enabled and text and text.strip())
 
 
 def to_hk(text: str) -> str:
@@ -127,7 +131,8 @@ def quick_clean(text: str, vocab: list = None, hk: bool = True) -> str:
 
 _CJK_CHAR_RE = re.compile(f"[{_CJK}]")
 _LATIN_RUN_RE = re.compile(r"[A-Za-z0-9]+")
-_FILLERS = {"呃", "嗯", "um", "uh"}
+_FILLERS = {"呃", "嗯", "啊", "誒", "欸", "即係", "你知道啦", "個嗰",
+            "um", "uh", "er", "erm", "ah", "you know"}
 _CC_T2S = None
 _JYUTPING = None
 
@@ -445,22 +450,56 @@ def parse_voice_commands(text: str) -> ParsedUtterance:
     return result
 
 
-# ---------------------------------------------------------------- profile rules
+# ------------------------------------------------------- verbatim guard
+# The Verbatim profile lets the LLM rewrite the WHOLE utterance, because the
+# misplaced 。／？ the ASR's ITN emits cannot be fixed by an {"from","to"} edit
+# list (see apply_edits' guards, which never touch punctuation). Handing a
+# model free rein is what CLAUDE.md warns about — verified live, it silently
+# converts Cantonese to written Chinese and reorders clauses. So the rewrite is
+# accepted only when it provably did nothing but DELETE characters and CHANGE
+# PUNCTUATION:
+#
+#   skeleton(s) = every character except punctuation/whitespace, casefolded.
+#   accept  <=>  skeleton(clean) is a subsequence of skeleton(base)
+#                AND it kept at least SKELETON_KEEP_MIN of the characters.
+#
+# Subsequence alone permits deleting fillers/stutters and rewriting every mark;
+# it forbids inserting a character, translating, converting to 書面語 and
+# reordering. It does NOT forbid summarising (a summary is trivially a
+# subsequence) — that is exactly what the length floor is for.
 
-def pick_profile(app_name: str, rules: dict, default_profile: str) -> str:
-    """Choose a formatting profile from the frontmost app name.
+SKELETON_KEEP_MIN = 0.7
 
-    Rule keys match as case-insensitive substrings of the app name.
-    Longest key wins so 'iTerm' beats 'Term'-style overlaps deterministically.
+_SKELETON_STRIP_RE = re.compile(r"[\W_]+", re.UNICODE)
+
+
+def skeleton(text: str) -> str:
+    """Characters that must survive a Verbatim rewrite: no punctuation, no
+    whitespace, case-insensitive (so `codex` -> `CodeX` is allowed but
+    `send` -> `sent` is not)."""
+    return _SKELETON_STRIP_RE.sub("", text or "").casefold()
+
+
+def is_subsequence(needle: str, haystack: str) -> bool:
+    """True when every character of `needle` appears in `haystack` in order."""
+    it = iter(haystack)
+    return all(ch in it for ch in needle)
+
+
+def guard_verbatim(base: str, cleaned: str,
+                   keep_min: float = SKELETON_KEEP_MIN) -> str:
+    """Accept the model's punctuation/filler cleanup, or fall back to `base`.
+
+    A rejected rewrite degrades to a no-op — the output is never corrupted.
     """
-    if not app_name:
-        return default_profile
-    lowered = app_name.lower()
-    best_key = None
-    for key in (rules or {}):
-        if key.lower() in lowered:
-            if best_key is None or len(key) > len(best_key):
-                best_key = key
-    if best_key is not None:
-        return rules[best_key]
-    return default_profile
+    if not cleaned or not cleaned.strip():
+        return base
+    base_sk = skeleton(base)
+    clean_sk = skeleton(cleaned)
+    if not base_sk:
+        return base
+    if not is_subsequence(clean_sk, base_sk):
+        return base          # inserted / translated / reordered / rewritten
+    if len(clean_sk) < keep_min * len(base_sk):
+        return base          # summarised away
+    return cleaned.strip()

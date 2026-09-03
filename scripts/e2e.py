@@ -16,7 +16,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from whisperflow_local.asr import ASREngine
 from whisperflow_local.config import Config
 from whisperflow_local.llm import LLMUnavailable, VLLMBackend
-from whisperflow_local.textproc import apply_dictionary, parse_voice_commands
+from whisperflow_local.textproc import (
+    apply_dictionary,
+    apply_edits,
+    guard_verbatim,
+    parse_voice_commands,
+    quick_clean,
+)
 
 
 def cantonese_voice() -> str:
@@ -105,13 +111,15 @@ def main() -> int:
 
         if llm_ok and parsed.text:
             try:
-                cleaned = llm.format_text(parsed.text, "Clean")
-                print(f"[clip {i}] Qwen3.8 Clean : {cleaned}")
+                base = quick_clean(parsed.text)
+                out = llm.propose_cleanup(base)
+                guarded = guard_verbatim(base, out["clean"])
+                cleaned = apply_edits(guarded, out["edits"])
+                kept = "accepted" if guarded is not base else "REJECTED by guard"
+                print(f"[clip {i}] Verbatim ({kept}): {cleaned}")
                 if i == 1:
-                    email = llm.format_text(parsed.text, "Email")
-                    print(f"[clip {i}] Qwen3.8 Email : {email}")
-                    translated = llm.run_command("Translate to English", parsed.text)
-                    print(f"[clip {i}] Qwen3.8 Translate to English: {translated}")
+                    print(f"[clip {i}] Structured   : "
+                          + llm.format_text(parsed.text, "Structured"))
             except LLMUnavailable as exc:
                 print(f"[clip {i}] LLM degraded gracefully: {exc}")
         elif not llm_ok:

@@ -5,7 +5,7 @@ Part A: real SenseVoice transcription of the last recording — proves the ASR
 engine still loads and runs after the post-correction changes.
 
 Part B: the EXACT shipped Clean pipeline
-  quick_clean -> apply_phonetic_hotwords -> llm.propose_edits -> apply_edits
+  quick_clean -> apply_phonetic_hotwords -> llm.propose_cleanup -> guard + apply_edits
 run against the real SenseVoice outputs captured in app.log (per-sentence
 audio is not retained, so we feed the genuine ASR strings), with real
 Qwen3.6-35B-A3B via GB10 vLLM. Prints before -> after so corrections and the
@@ -84,7 +84,7 @@ def main():
     for raw, note in FIELD:
         base = quick_clean(raw, vocab=vocab, hk=hk)
         after_hw = apply_phonetic_hotwords(base, vocab)
-        edits = llm.propose_edits(after_hw, vocab=vocab)
+        edits = llm.propose_cleanup(after_hw, vocab=vocab)["edits"]
         final = apply_edits(after_hw, edits, vocab=vocab)
         print(f"  # {note}")
         print(f"  before: {raw}")

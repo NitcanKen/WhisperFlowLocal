@@ -37,6 +37,7 @@ from whisperflow_local.textproc import (  # noqa: E402
     apply_dictionary,
     apply_edits,
     apply_phonetic_hotwords,
+    guard_verbatim,
     parse_voice_commands,
     quick_clean,
     vocab_terms,
@@ -69,8 +70,9 @@ def pipeline_once(audio, asr, cfg, llm, mode):
         formatted = quick_clean(formatted, vocab=vocab, hk=hk)
         formatted = apply_phonetic_hotwords(formatted, vocab)
         try:
-            edits = llm.propose_edits(formatted, vocab=vocab)
-            formatted = apply_edits(formatted, edits, vocab=vocab)
+            out = llm.propose_cleanup(formatted, vocab=vocab)
+            formatted = guard_verbatim(formatted, out["clean"])
+            formatted = apply_edits(formatted, out["edits"], vocab=vocab)
         except LLMUnavailable:
             pass  # quick_clean + hotword output already stands on its own
     insert(formatted, copy_only=True)  # test sink: clipboard, no focus needed

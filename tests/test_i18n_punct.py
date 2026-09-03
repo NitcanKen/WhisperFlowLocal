@@ -16,8 +16,7 @@ def test_english_and_zh_hk_strings():
     set_language("zh-HK")
     assert tr("menu_settings") == "設定"
     assert tr("menu_quit") == "結束"
-    assert tr("profile_Email") == "電郵"
-    assert tr("cmd_Translate to Cantonese") == "譯做廣東話"
+    assert tr("menu_profile") == "格式化模式"
 
 
 def test_formatting_kwargs():

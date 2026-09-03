@@ -10,7 +10,7 @@ third-party cloud service is used.
 - **AI cleanup**: `Qwen3.6-35B-A3B` through the GB10's OpenAI-compatible vLLM API
   (thinking disabled). Ollama is not used.
 - **Everything else**: native menu-bar app (rumps), global hotkeys (pynput),
-  clipboard-paste insertion, per-app formatting profiles, custom dictionary,
+  clipboard-paste insertion, two formatting modes, content generation, custom dictionary,
   voice commands, SQLite history, launch-at-login.
 
 ## Requirements
@@ -87,17 +87,26 @@ Restart the app after granting.
 | --- | --- |
 | Push-to-talk | **hold Right Option**, speak, release |
 | Hands-free toggle | **⌘⇧D** to start, again to stop |
-| Formatting profile | menu → Formatting Profile (Raw / Clean / Email / Message / Notes) |
+| Formatting mode | menu → Formatting Mode (原文口語 Verbatim / 書面結構化 Structured) |
 | Language | menu → Language (Auto / Cantonese / English / Mixed) |
-| AI commands | menu → AI Commands (Formalize / Summarize / Translate ⇄) |
+| Content generation | **hold Shift + Right Option**, speak a request, release |
 | History | menu → History (click an entry to re-insert) |
 
 **Voice commands** (spoken, not typed): "new line", "new paragraph" (新段落),
 "press enter" / 發送 at the end, "scratch that" / 當我冇講過 to undo the last
 dictation, "all caps …".
 
-**Per-app profiles**: Mail auto-formats as Email, Messages/Slack as chat,
-Terminal/VS Code stays Raw — editable in Settings → Edit Per-App Rules.
+**Formatting modes**: *Verbatim* keeps your spoken wording and only fixes
+punctuation, drops fillers/stutters and corrects ASR homophone slips — a guard
+makes it impossible for the model to translate, reorder or summarise you.
+*Structured* understands the whole utterance and re-emits it as structured
+written Chinese, resolving self-corrections ("坐 89X… 唔係，268") to what you
+finally meant.
+
+**Content generation**: hold Shift + Right Option and say what you want written
+("draft an email to Lulu saying…"). The result is pasted where you are typing.
+If the request is ambiguous the recording pill becomes a small panel asking at
+most two questions — click an option or press 1-3, Esc to cancel.
 
 **Custom dictionary**: Settings → Edit Dictionary — fix names and jargon
 (e.g. `"kenny" → "Ken Ng"`).

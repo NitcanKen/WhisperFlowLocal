@@ -15,6 +15,7 @@ Requires the macOS Input Monitoring permission.
 """
 import queue
 import threading
+from functools import partial
 
 from pynput import keyboard
 
@@ -92,6 +93,64 @@ def combo_string(mods, trigger_name: str) -> str:
     return "+".join(parts)
 
 
+def context_mods(mods_held, key) -> frozenset:
+    """Modifiers held *besides* the pressed key's own modifier family.
+
+    _on_press records the pressed key's own modifier in _mods_held BEFORE
+    matching runs, so a bare Right-Option press arrives as {"alt"}, never as
+    the empty set. A held binding must therefore compare against the context —
+    what else was already down — or 'alt_r' could never match "no modifiers"
+    and '<shift>+<alt_r>' could never match "shift".
+    """
+    own = MODIFIER_MAP.get(key)
+    return frozenset(m for m in mods_held if m != own)
+
+
+def hold_matches(mods_held, key, spec_mods, spec_key) -> bool:
+    """True when pressing `key` with `mods_held` satisfies a held binding.
+
+    Plain push-to-talk is modelled as a hold binding with an EMPTY modifier
+    set, so push-to-talk and the generation combo are matched by the same
+    predicate and are mutually exclusive by construction — no priority rule.
+    """
+    if spec_key is None or not _keys_equal(key, spec_key):
+        return False
+    return context_mods(mods_held, key) == frozenset(spec_mods or ())
+
+
+def parse_hold_combo(spec: str):
+    """'<shift>+<alt_r>' -> (frozenset({'shift'}), Key.alt_r); '' -> (None, None).
+
+    Same grammar as parse_combo, but a HELD binding's trigger may itself be a
+    modifier key, so the trigger's own modifier family must not also appear in
+    the modifier set — '<alt>+<alt_r>' can never be satisfied.
+    """
+    mods, trigger = parse_combo(spec)
+    if trigger is None:
+        return None, None
+    own = MODIFIER_MAP.get(trigger)
+    if own and own in mods:
+        raise ValueError(f"Hold combo modifier collides with its trigger: {spec!r}")
+    return mods, trigger
+
+
+def retarget_hold(spec: str, old_key_name: str, new_key_name: str) -> str:
+    """Keep a hold combo pointing at the push-to-talk key when PTT is rebound.
+
+    Returns `spec` unchanged when its trigger is not `old_key_name`, so a
+    deliberately independent generation binding is never hijacked.
+    """
+    if not spec:
+        return spec
+    try:
+        mods, trigger = parse_hold_combo(spec)
+    except ValueError:
+        return spec
+    if trigger is None or key_name(trigger) != old_key_name:
+        return spec
+    return combo_string(mods, new_key_name)
+
+
 def _keys_equal(a, b) -> bool:
     if a is None or b is None:
         return False
@@ -118,28 +177,51 @@ class CaptureSession:
 
 
 class HotkeyManager:
-    """Owns the single global listener; dispatches PTT, toggle and capture.
+    """Owns the single global listener; dispatches holds, toggle and capture.
 
-    Callbacks fire on the listener thread — they must not touch AppKit.
+    Two HELD bindings share one push-to-talk key: pressing it alone dictates,
+    pressing it with the generation combo's modifiers starts a content
+    generation. on_ptt_down/on_ptt_up receive the mode ("dictate"|"generate").
+
+    Callbacks fire off the listener thread (see _fire) — they must not touch
+    AppKit.
     """
 
     def __init__(self, ptt_key_name: str, toggle_combo: str,
-                 on_ptt_down, on_ptt_up, on_toggle):
+                 generate_combo: str = "",
+                 *, on_ptt_down, on_ptt_up, on_toggle):
         self.on_ptt_down = on_ptt_down
         self.on_ptt_up = on_ptt_up
         self.on_toggle = on_toggle
         self._lock = threading.Lock()
-        self._ptt_key = resolve_key(ptt_key_name)
+        self._holds = self._build_holds(ptt_key_name, generate_combo)
+        # Which hold binding owns the keyboard right now (None = none). The
+        # mode is latched at press time, so releasing Shift mid-hold cannot
+        # switch a generation session into a dictation one.
+        self._hold_key = None
+        self._hold_mode = None
         self._combo_mods, self._combo_trigger = parse_combo(toggle_combo)
-        self._ptt_held = False
         self._combo_latched = False
         self._mods_held = set()
         self._capture = None
+        # Set while the clarify panel owns the keyboard: the panel is key, so
+        # the digits are already going to it — the listener must merely stop
+        # holds/toggles from firing underneath the panel.
+        self._suppressed = False
         self._listener = None
         # Callbacks are dispatched to this FIFO thread instead of running inline
         # on the pynput tap thread — see _fire.
         self._cb_queue = queue.Queue()
         self._pump = None
+
+    @staticmethod
+    def _build_holds(ptt_key_name: str, generate_combo: str) -> dict:
+        """Held bindings, generation first. Plain PTT is the empty-modifier
+        binding, so the two can never both match (see hold_matches)."""
+        return {
+            "generate": parse_hold_combo(generate_combo),
+            "dictate": (frozenset(), resolve_key(ptt_key_name)),
+        }
 
     # -- event handling (listener thread) --------------------------------
     def _on_press(self, key):
@@ -151,10 +233,15 @@ class HotkeyManager:
             if capture is not None and capture.state == "waiting":
                 self._handle_capture_press(capture, key, mod)
                 return
-            fire_down = False
-            if _keys_equal(key, self._ptt_key) and not self._ptt_held:
-                self._ptt_held = True
-                fire_down = True
+            if self._suppressed:
+                return
+            down_mode = None
+            if self._hold_key is None:      # one hold session at a time
+                for mode, (spec_mods, spec_key) in self._holds.items():
+                    if hold_matches(self._mods_held, key, spec_mods, spec_key):
+                        self._hold_key, self._hold_mode = key, mode
+                        down_mode = mode
+                        break
             fire_toggle = False
             if (self._combo_trigger is not None
                     and _keys_equal(key, self._combo_trigger)
@@ -162,8 +249,8 @@ class HotkeyManager:
                     and not self._combo_latched):
                 self._combo_latched = True
                 fire_toggle = True
-        if fire_down:
-            self._fire(self.on_ptt_down)
+        if down_mode:
+            self._fire(partial(self.on_ptt_down, down_mode))
         if fire_toggle:
             self._fire(self.on_toggle)
 
@@ -175,12 +262,14 @@ class HotkeyManager:
             if self._combo_latched and (
                     _keys_equal(key, self._combo_trigger) or mod):
                 self._combo_latched = False
-            fire_up = False
-            if _keys_equal(key, self._ptt_key) and self._ptt_held:
-                self._ptt_held = False
-                fire_up = True
-        if fire_up:
-            self._fire(self.on_ptt_up)
+            # Release matches on key identity ONLY and never re-reads
+            # _mods_held: whichever session started is the one that ends.
+            up_mode = None
+            if self._hold_key is not None and _keys_equal(key, self._hold_key):
+                up_mode = self._hold_mode
+                self._hold_key = self._hold_mode = None
+        if up_mode:
+            self._fire(partial(self.on_ptt_up, up_mode))
 
     # -- off-thread callback dispatch ------------------------------------
     def _fire(self, callback) -> None:
@@ -251,6 +340,19 @@ class HotkeyManager:
                 capture.state = "done"
                 self._capture = None
 
+    def set_suppressed(self, on: bool) -> None:
+        """Silence hold/toggle dispatch (used while the clarify panel is up).
+
+        Modifier bookkeeping keeps running, so releases stay consistent; only
+        the callbacks are withheld. Any in-flight hold is dropped so its
+        release cannot fire after the panel closes.
+        """
+        with self._lock:
+            self._suppressed = bool(on)
+            if on:
+                self._hold_key = self._hold_mode = None
+                self._combo_latched = False
+
     # -- capture mode ------------------------------------------------------
     def begin_capture(self, kind: str) -> CaptureSession:
         """Start one-shot capture ('ptt' or 'toggle'); suppresses normal
@@ -286,13 +388,16 @@ class HotkeyManager:
             self._listener = None
         self._stop_pump()
 
-    def update(self, ptt_key_name: str, toggle_combo: str) -> None:
+    def update(self, ptt_key_name: str, toggle_combo: str,
+               generate_combo: str = "") -> None:
         """Re-bind hotkeys at runtime by swapping match targets. The
         listener is intentionally left untouched (see module docstring)."""
-        new_ptt = resolve_key(ptt_key_name)
+        new_holds = self._build_holds(ptt_key_name, generate_combo)
         new_mods, new_trigger = parse_combo(toggle_combo)
         with self._lock:
-            self._ptt_key = new_ptt
+            self._holds = new_holds
             self._combo_mods, self._combo_trigger = new_mods, new_trigger
-            self._ptt_held = False
+            # Drop any in-flight hold: its key may no longer be bound, and a
+            # stuck session would swallow every later press.
+            self._hold_key = self._hold_mode = None
             self._combo_latched = False

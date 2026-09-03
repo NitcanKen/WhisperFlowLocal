@@ -50,15 +50,19 @@ def pretty_key(name: str) -> str:
 
 
 def pretty_combo(combo: str) -> str:
-    """Combo text -> compact symbols ('<cmd>+<shift>+d' -> '⌘⇧D')."""
+    """Combo text -> compact symbols ('<cmd>+<shift>+d' -> '⌘⇧D').
+
+    A held combo's trigger may itself be a named key ('<shift>+<alt_r>'), so
+    non-modifier tokens go through pretty_key rather than a bare .upper(),
+    which would render 'ALT_R'.
+    """
     out = []
     for token in (combo or "").split("+"):
         token = token.strip()
+        if not token:
+            continue
         inner = token[1:-1] if token.startswith("<") and token.endswith(">") else token
-        if inner in _MOD_SYMBOL:
-            out.append(_MOD_SYMBOL[inner])
-        else:
-            out.append(inner.upper() if len(inner) == 1 else inner.upper())
+        out.append(_MOD_SYMBOL[inner] if inner in _MOD_SYMBOL else pretty_key(inner))
     return "".join(out)
 
 

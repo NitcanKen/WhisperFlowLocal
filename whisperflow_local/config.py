@@ -5,11 +5,22 @@ import threading
 
 from . import paths
 
+# Old five-profile installs map onto the two surviving modes.
+_PROFILE_MIGRATION = {
+    "Raw": "Verbatim", "Clean": "Verbatim", "Message": "Verbatim",
+    "Email": "Structured", "Notes": "Structured",
+}
+
 DEFAULTS = {
     # Push-to-talk: hold this key to record (pynput key name, e.g. alt_r, cmd_r, f18)
     "ptt_key": "alt_r",
     # Hands-free toggle combo (pynput GlobalHotKeys syntax)
     "toggle_hotkey": "<cmd>+<shift>+d",
+    # HOLD this instead of the bare ptt_key to dictate a content-generation
+    # request (the LLM writes the text rather than transcribing it). Same
+    # grammar as toggle_hotkey, but held, and its trigger may itself be a
+    # modifier. Empty string disables generation.
+    "generate_hotkey": "<shift>+<alt_r>",
     # ASR language mode: auto | yue | en | mixed
     "language": "auto",
     # ASR engine selection (mirrors llm_backend):
@@ -51,8 +62,12 @@ DEFAULTS = {
     # after fallback_cooldown seconds (auto-retry).
     "fallback_threshold": 3,
     "fallback_cooldown": 300.0,
-    # Default formatting profile: Raw | Clean | Email | Message | Notes
-    "profile": "Clean",
+    # Formatting profile, chosen from the menu and never overridden:
+    #   "Verbatim"   = keep the spoken wording; the LLM only repunctuates,
+    #                  drops fillers/stutters and fixes ASR homophones.
+    #   "Structured" = understand the utterance and re-emit it as structured
+    #                  written Chinese.
+    "profile": "Verbatim",
     "copy_only": False,
     "sounds": True,
     # Output punctuation on/off (applies after ASR + LLM formatting)
@@ -68,18 +83,6 @@ DEFAULTS = {
     # Bare hotword terms (no replacement): bias the LLM prompt and, for ASR
     # engines with context biasing, the recognizer itself
     "hotwords": [],
-    # Frontmost-app name (substring, case-insensitive) -> profile
-    "app_rules": {
-        "Mail": "Email",
-        "Messages": "Message",
-        "Slack": "Message",
-        "Discord": "Message",
-        "WhatsApp": "Message",
-        "Terminal": "Raw",
-        "iTerm": "Raw",
-        "Code": "Raw",
-        "Notes": "Notes",
-    },
     "onboarded": False,
 }
 
@@ -110,6 +113,15 @@ class Config:
                     merged["llm_backend"] = "remote"
                     merged.pop("ollama_url", None)
                     merged.pop("ollama_model", None)
+                    # Five profiles collapsed to two. An un-migrated legacy
+                    # value would match no menu item: every checkmark would go
+                    # dark and format_text would silently pass text through.
+                    merged["profile"] = _PROFILE_MIGRATION.get(
+                        merged.get("profile"), merged.get("profile"))
+                    if merged.get("profile") not in ("Verbatim", "Structured"):
+                        merged["profile"] = DEFAULTS["profile"]
+                    # Per-app rules are gone: the menu choice is authoritative.
+                    merged.pop("app_rules", None)
                     self.data = merged
                 except (json.JSONDecodeError, OSError):
                     # Corrupt config: keep defaults, do not crash the app.

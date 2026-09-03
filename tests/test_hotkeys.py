@@ -10,19 +10,26 @@ from pynput import keyboard
 from whisperflow_local.hotkeys import (
     HotkeyManager,
     combo_string,
+    context_mods,
+    hold_matches,
     key_name,
     parse_combo,
+    parse_hold_combo,
     resolve_key,
+    retarget_hold,
 )
 
 
-def make_mgr(ptt="alt_r", combo="<cmd>+<shift>+d"):
-    counts = {"down": 0, "up": 0, "toggle": 0}
+def make_mgr(ptt="alt_r", combo="<cmd>+<shift>+d", gen="<shift>+<alt_r>"):
+    # down/up collect the MODE of each hold session, so the tests assert what
+    # was started, not just how many times.
+    counts = {"down": [], "up": [], "toggle": 0}
     mgr = HotkeyManager(
         ptt,
         combo,
-        on_ptt_down=lambda: counts.__setitem__("down", counts["down"] + 1),
-        on_ptt_up=lambda: counts.__setitem__("up", counts["up"] + 1),
+        gen,
+        on_ptt_down=lambda mode: counts["down"].append(mode),
+        on_ptt_up=lambda mode: counts["up"].append(mode),
         on_toggle=lambda: counts.__setitem__("toggle", counts["toggle"] + 1),
     )
     return mgr, counts
@@ -71,20 +78,20 @@ def test_combo_string_canonical_order():
 def test_ptt_press_release():
     mgr, counts = make_mgr()
     mgr._on_press(keyboard.Key.alt_r)
-    assert counts["down"] == 1
+    assert counts["down"] == ["dictate"]
     mgr._on_press(keyboard.Key.alt_r)  # macOS auto-repeat
-    assert counts["down"] == 1
+    assert counts["down"] == ["dictate"]
     mgr._on_release(keyboard.Key.alt_r)
-    assert counts["up"] == 1
+    assert counts["up"] == ["dictate"]
     mgr._on_release(keyboard.Key.alt_r)
-    assert counts["up"] == 1
+    assert counts["up"] == ["dictate"]
 
 
 def test_other_keys_do_not_fire_ptt():
     mgr, counts = make_mgr()
     mgr._on_press(keyboard.Key.alt_l)
     mgr._on_press(D)
-    assert counts["down"] == 0
+    assert counts["down"] == []
 
 
 def test_rebind_swaps_targets_without_touching_listener():
@@ -94,11 +101,14 @@ def test_rebind_swaps_targets_without_touching_listener():
     mgr.update("f18", "<cmd>+<shift>+d")
     assert mgr._listener is sentinel
     mgr._on_press(keyboard.Key.alt_r)
-    assert counts["down"] == 0
+    assert counts["down"] == []
+    # alt_r is itself a modifier: release it, or it stays in _mods_held and
+    # the (strict) empty-context requirement blocks the next hold.
+    mgr._on_release(keyboard.Key.alt_r)
     mgr._on_press(keyboard.Key.f18)
-    assert counts["down"] == 1
+    assert counts["down"] == ["dictate"]
     mgr._on_release(keyboard.Key.f18)
-    assert counts["up"] == 1
+    assert counts["up"] == ["dictate"]
 
 
 # ------------------------------------------------------------ off-thread dispatch
@@ -115,14 +125,14 @@ def test_slow_callback_does_not_block_the_listener_thread():
     release = threading.Event()
     done = threading.Event()
 
-    def slow_down():
+    def slow_down(mode):
         started.set()
         release.wait(2.0)
         done.set()
 
     mgr = HotkeyManager(
         "alt_r", "",
-        on_ptt_down=slow_down, on_ptt_up=lambda: None, on_toggle=lambda: None,
+        on_ptt_down=slow_down, on_ptt_up=lambda mode: None, on_toggle=lambda: None,
     )
     mgr._start_pump()
     try:
@@ -142,8 +152,8 @@ def test_dispatched_callbacks_keep_press_then_release_order():
     order = []
     mgr = HotkeyManager(
         "alt_r", "",
-        on_ptt_down=lambda: order.append("down"),
-        on_ptt_up=lambda: order.append("up"),
+        on_ptt_down=lambda mode: order.append("down"),
+        on_ptt_up=lambda mode: order.append("up"),
         on_toggle=lambda: None,
     )
     mgr._start_pump()
@@ -162,8 +172,8 @@ def test_a_raising_callback_does_not_kill_the_pump():
     order = []
     mgr = HotkeyManager(
         "alt_r", "",
-        on_ptt_down=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
-        on_ptt_up=lambda: order.append("up"),
+        on_ptt_down=lambda mode: (_ for _ in ()).throw(RuntimeError("boom")),
+        on_ptt_up=lambda mode: order.append("up"),
         on_toggle=lambda: None,
     )
     mgr._start_pump()
@@ -246,7 +256,7 @@ def test_capture_ptt_takes_next_key_including_bare_modifier():
     assert session.result == "f19"
     # capture is one-shot: normal handling resumes afterwards
     mgr._on_press(keyboard.Key.alt_r)
-    assert counts["down"] == 1
+    assert counts["down"] == ["dictate"]
 
 
 def test_capture_ptt_bare_modifier():
@@ -261,7 +271,7 @@ def test_capture_suppresses_normal_callbacks():
     mgr, counts = make_mgr()
     mgr.begin_capture("ptt")
     mgr._on_press(keyboard.Key.alt_r)  # is the current PTT key
-    assert counts["down"] == 0
+    assert counts["down"] == []
 
 
 def test_capture_esc_cancels():
@@ -300,3 +310,188 @@ def test_pretty_key_and_combo():
     assert pretty_key("a") == "A"
     assert pretty_combo("<cmd>+<shift>+d") == "⌘⇧D"
     assert pretty_combo("<ctrl>+<f5>") == "⌃F5"
+
+
+# ------------------------------------------------ hold bindings (dictate/generate)
+# Both push-to-talk and the generation combo are HELD bindings on the same
+# key. _on_press records the pressed key's own modifier in _mods_held BEFORE
+# matching, so a bare Right-Option press arrives as {"alt"} — matching must
+# therefore compare the modifier CONTEXT, not the raw set.
+
+def test_context_mods_excludes_the_pressed_keys_own_modifier():
+    assert context_mods({"alt"}, keyboard.Key.alt_r) == frozenset()
+    assert context_mods({"alt", "shift"}, keyboard.Key.alt_r) == frozenset({"shift"})
+    assert context_mods({"cmd"}, D) == frozenset({"cmd"})
+
+
+def test_hold_matches_is_exclusive_between_bare_and_modified():
+    bare, modified = (frozenset(), keyboard.Key.alt_r), ({"shift"}, keyboard.Key.alt_r)
+    for held in ({"alt"}, {"alt", "shift"}):
+        got = [hold_matches(held, keyboard.Key.alt_r, m, k) for m, k in (bare, modified)]
+        assert got.count(True) == 1, held
+
+
+def test_hold_matches_ignores_a_different_key():
+    assert not hold_matches({"alt"}, keyboard.Key.alt_r, frozenset(), keyboard.Key.f18)
+    assert not hold_matches({"alt"}, keyboard.Key.alt_r, frozenset(), None)
+
+
+def test_parse_hold_combo_accepts_a_modifier_trigger():
+    assert parse_hold_combo("<shift>+<alt_r>") == (frozenset({"shift"}), keyboard.Key.alt_r)
+    assert parse_hold_combo("") == (None, None)
+
+
+def test_parse_hold_combo_rejects_a_self_colliding_modifier():
+    with pytest.raises(ValueError):
+        parse_hold_combo("<alt>+<alt_r>")
+
+
+def test_retarget_hold_follows_a_ptt_rebind():
+    assert retarget_hold("<shift>+<alt_r>", "alt_r", "f18") == "<shift>+<f18>"
+    # an independent binding is never hijacked
+    assert retarget_hold("<ctrl>+<f19>", "alt_r", "f18") == "<ctrl>+<f19>"
+    assert retarget_hold("", "alt_r", "f18") == ""
+
+
+def test_bare_ptt_key_starts_dictation():
+    mgr, counts = make_mgr()
+    mgr._on_press(keyboard.Key.alt_r)
+    mgr._on_release(keyboard.Key.alt_r)
+    assert counts["down"] == ["dictate"] and counts["up"] == ["dictate"]
+
+
+def test_shift_plus_ptt_key_starts_generation_not_dictation():
+    mgr, counts = make_mgr()
+    mgr._on_press(keyboard.Key.shift)
+    mgr._on_press(keyboard.Key.alt_r)
+    assert counts["down"] == ["generate"]
+    mgr._on_release(keyboard.Key.alt_r)
+    mgr._on_release(keyboard.Key.shift)
+    assert counts["up"] == ["generate"]
+
+
+def test_releasing_shift_mid_hold_keeps_the_generation_session():
+    mgr, counts = make_mgr()
+    for k in (keyboard.Key.shift, keyboard.Key.alt_r):
+        mgr._on_press(k)
+    mgr._on_release(keyboard.Key.shift)   # let go of Shift, keep holding alt_r
+    mgr._on_release(keyboard.Key.alt_r)
+    assert counts["down"] == ["generate"] and counts["up"] == ["generate"]
+
+
+def test_shift_pressed_after_the_ptt_key_does_not_switch_mode():
+    mgr, counts = make_mgr()
+    mgr._on_press(keyboard.Key.alt_r)
+    mgr._on_press(keyboard.Key.shift)
+    mgr._on_release(keyboard.Key.shift)
+    mgr._on_release(keyboard.Key.alt_r)
+    assert counts["down"] == ["dictate"] and counts["up"] == ["dictate"]
+
+
+def test_an_unrelated_modifier_blocks_the_hold():
+    # Strictness is deliberate: it is what makes the two bindings provably
+    # disjoint. Cmd+Right-Option used to start dictation; now it does nothing.
+    mgr, counts = make_mgr()
+    mgr._on_press(keyboard.Key.cmd)
+    mgr._on_press(keyboard.Key.alt_r)
+    mgr._on_release(keyboard.Key.alt_r)
+    assert counts["down"] == [] and counts["up"] == []
+
+
+def test_generation_hold_suppresses_auto_repeat():
+    mgr, counts = make_mgr()
+    mgr._on_press(keyboard.Key.shift)
+    for _ in range(3):
+        mgr._on_press(keyboard.Key.alt_r)
+    mgr._on_release(keyboard.Key.alt_r)
+    assert counts["down"] == ["generate"] and counts["up"] == ["generate"]
+
+
+def test_only_one_hold_session_at_a_time():
+    mgr, counts = make_mgr(gen="<shift>+<f18>")
+    mgr._on_press(keyboard.Key.alt_r)             # dictation starts
+    mgr._on_press(keyboard.Key.shift)
+    mgr._on_press(keyboard.Key.f18)               # ignored: session in flight
+    mgr._on_release(keyboard.Key.f18)             # ...so its release fires nothing
+    assert counts["down"] == ["dictate"] and counts["up"] == []
+    mgr._on_release(keyboard.Key.alt_r)
+    assert counts["up"] == ["dictate"]
+
+
+def test_empty_generate_combo_disables_generation_but_keeps_dictation():
+    mgr, counts = make_mgr(gen="")
+    mgr._on_press(keyboard.Key.shift)
+    mgr._on_press(keyboard.Key.alt_r)
+    mgr._on_release(keyboard.Key.alt_r)
+    mgr._on_release(keyboard.Key.shift)
+    assert counts["down"] == []
+    mgr._on_press(keyboard.Key.alt_r)
+    mgr._on_release(keyboard.Key.alt_r)
+    assert counts["down"] == ["dictate"]
+
+
+def test_generate_rebind_at_runtime_keeps_the_listener():
+    mgr, counts = make_mgr()
+    sentinel = object()
+    mgr._listener = sentinel
+    mgr.update("alt_r", "", "<ctrl>+<f18>")
+    assert mgr._listener is sentinel
+    mgr._on_press(keyboard.Key.ctrl)
+    mgr._on_press(keyboard.Key.f18)
+    assert counts["down"] == ["generate"]
+
+
+def test_update_clears_a_stuck_hold():
+    mgr, counts = make_mgr()
+    mgr._on_press(keyboard.Key.alt_r)
+    assert counts["down"] == ["dictate"]
+    mgr.update("alt_r", "<cmd>+<shift>+d", "<shift>+<alt_r>")
+    mgr._on_release(keyboard.Key.alt_r)
+    assert counts["up"] == []                     # the stuck session was dropped
+    mgr._on_press(keyboard.Key.alt_r)             # and a fresh one still works
+    assert counts["down"] == ["dictate", "dictate"]
+
+
+# ---------------------------------------------------- clarify-panel suppression
+# While the clarify panel is up it is the key window, so the digits already go
+# to it. The listener's only job is to stop a hold or the toggle from firing
+# underneath the panel.
+
+def test_suppression_silences_holds_and_toggle():
+    mgr, counts = make_mgr()
+    mgr.set_suppressed(True)
+    mgr._on_press(keyboard.Key.alt_r)
+    mgr._on_release(keyboard.Key.alt_r)
+    mgr._on_press(keyboard.Key.cmd)
+    mgr._on_press(keyboard.Key.shift)
+    mgr._on_press(D)
+    assert counts["down"] == [] and counts["up"] == [] and counts["toggle"] == 0
+
+
+def test_suppression_drops_an_in_flight_hold():
+    # Otherwise the release after the panel closes would fire an unmatched up.
+    mgr, counts = make_mgr()
+    mgr._on_press(keyboard.Key.alt_r)
+    assert counts["down"] == ["dictate"]
+    mgr.set_suppressed(True)
+    mgr._on_release(keyboard.Key.alt_r)
+    assert counts["up"] == []
+
+
+def test_resuming_after_suppression_restores_dispatch():
+    mgr, counts = make_mgr()
+    mgr.set_suppressed(True)
+    mgr.set_suppressed(False)
+    mgr._on_press(keyboard.Key.alt_r)
+    mgr._on_release(keyboard.Key.alt_r)
+    assert counts["down"] == ["dictate"] and counts["up"] == ["dictate"]
+
+
+def test_capture_still_wins_over_suppression():
+    # A settings re-bind must always be reachable and escapable.
+    mgr, counts = make_mgr()
+    session = mgr.begin_capture("ptt")
+    mgr.set_suppressed(True)
+    mgr._on_press(keyboard.Key.f18)
+    assert session.state == "done" and session.result == "f18"
+    assert counts["down"] == []
