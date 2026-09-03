@@ -213,7 +213,11 @@ GENERATE_SYSTEM = """你係寫作助手。用戶會口頭講一個要求，你�
   compose window 入面，主旨行貼落正文會錯位）。除非用戶明確叫你寫主旨。
 - **唔准喺輸出入面出現方括號 [ ]**。你唔知用戶叫咩名，所以寫完 "Best regards,"
   就即刻收筆，唔好加 [Your Name]／[Date]／XXX 之類嘅嘢等用戶自己填。
-- 跟足用戶指定嘅語言。冇指定就跟佢講嘢嘅語言。
+- 語言／字體跟足用戶指定。冇指定就跟佢講嘢嘅語言。
+- **成品一定要用書面語**。用戶係用廣東話口語講要求俾你聽，但佢要嘅成品
+  （email、訊息、文件）唔係口語。廣東話口語字一律唔准出現喺輸出：
+  我哋→我們、佢→他／她、咗→了、嘅→的、係→是、唔→不、乜嘢→什麼、
+  而家→現在、點樣→如何、俾→給。除非用戶明確叫你寫得口語啲。
 - 唔准無中生有：用戶冇提供嘅事實（日期、金額、人名）唔准杜撰。
 - 語氣自然、專業、精簡。"""
 
@@ -337,10 +341,28 @@ class BaseLLMBackend:
             system += (
                 "\n用戶常用詞（用返呢個寫法）：" + "、".join(vocab)
             )
+        # The answers go in the SYSTEM prompt as hard constraints, not as a
+        # parenthetical tacked onto the request. Appended to the user message
+        # they were routinely ignored: asked in Cantonese for "Simplified
+        # Chinese", the model kept answering in Traditional because the
+        # request's own language dominated.
+        constraints = [f"- {q['question']}　用戶答：{a}"
+                       for q, a in zip(questions or [], answers or []) if a]
         user = request
-        for q, a in zip(questions or [], answers or []):
-            if a:
-                user += f"\n（{q['question']} → {a}）"
+        if constraints:
+            system += (
+                "\n\n用戶已經明確指定咗以下要求，**必須嚴格遵守**，凌駕上面所有預設。"
+                "特別係語言同字體：用戶叫你用邊種語言、邊種字體（簡體／繁體）就一定要用"
+                "邊種，即使佢個要求本身係用另一種語言或者字體講出嚟。\n"
+                + "\n".join(constraints))
+            # ...and restated at the END of the user message. Measured against
+            # the live model: in the system prompt alone, "简体中文" still came
+            # back in Traditional, because this prompt and the spoken request
+            # are both Traditional Cantonese and prime the script. Repeating
+            # the answers last, verbatim, is what actually binds them.
+            picked = [a for a in (answers or []) if a]
+            if picked:
+                user += "\n\n（輸出必須跟足：" + "；".join(picked) + "）"
         return self._chat(system, user)
 
 

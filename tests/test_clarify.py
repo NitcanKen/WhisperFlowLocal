@@ -273,11 +273,68 @@ def test_generate_pairs_only_the_answered_questions():
 
     class B(BaseLLMBackend):
         def _chat(self, system, user, force_json=False):
-            seen["user"] = user
+            seen.update(system=system, user=user)
             return "written"
 
     qs = [{"question": "用咩語言寫？", "options": ["English", "繁體中文"]},
           {"question": "幾正式？", "options": ["正式", "輕鬆"]}]
     B("http://x", "m").generate("draft an email", questions=qs, answers=["English"])
-    assert "用咩語言寫？" in seen["user"] and "English" in seen["user"]
-    assert "幾正式？" not in seen["user"]
+    assert "用咩語言寫？" in seen["system"] and "English" in seen["system"]
+    assert "幾正式？" not in seen["system"]    # unanswered: must not appear
+    assert "English" in seen["user"]
+
+
+# ---------------------------------------------------- clarify answers bind
+# Reported: typing "simplified Chinese" into the free-text field still
+# produced traditional. The answer WAS captured (the log showed
+# "clarify answered: ['Simplified Chinese']") — it just never bound.
+
+def test_answers_are_restated_at_the_end_of_the_user_message():
+    # Measured against the live model: in the system prompt alone the answer
+    # loses to the request's own language. Repeating it last is what binds it.
+    from whisperflow_local.llm import BaseLLMBackend
+    seen = {}
+
+    class B(BaseLLMBackend):
+        def _chat(self, system, user, force_json=False):
+            seen.update(system=system, user=user)
+            return "written"
+
+    qs = [{"question": "用咩語言寫？", "options": ["English", "繁體中文"]}]
+    B("http://x", "m").generate("幫我寫封 email", questions=qs,
+                                answers=["简体中文"])
+    assert "简体中文" in seen["system"]          # as a hard constraint...
+    assert "简体中文" in seen["user"]            # ...and restated last
+    assert seen["user"].rstrip().endswith("）")
+
+
+def test_no_trailing_restatement_when_nothing_was_answered():
+    from whisperflow_local.llm import BaseLLMBackend
+    seen = {}
+
+    class B(BaseLLMBackend):
+        def _chat(self, system, user, force_json=False):
+            seen["user"] = user
+            return "written"
+
+    B("http://x", "m").generate("幫我寫封 email", questions=[], answers=[])
+    assert seen["user"] == "幫我寫封 email"
+
+
+def test_requested_script_reads_either_phrasing():
+    from whisperflow_local.textproc import requested_script
+    for answer in ("Simplified Chinese", "简体中文", "簡體", "zh-Hans", "hans"):
+        assert requested_script([answer]) == "simplified", answer
+    for answer in ("繁體中文", "Traditional Chinese", "zh-HK", "hant"):
+        assert requested_script([answer]) == "traditional", answer
+    for answer in ("English", "日本語", "正式", "", "  "):
+        assert requested_script([answer]) is None, answer
+    assert requested_script([]) is None
+    assert requested_script(["正式", "简体中文"]) == "simplified"
+
+
+def test_script_conversion_is_deterministic_and_leaves_latin_alone():
+    from whisperflow_local.textproc import to_hk, to_simplified
+    assert to_simplified("我們已完成開發工作") == "我们已完成开发工作"
+    assert to_hk("我们已完成开发工作") == "我們已完成開發工作"
+    assert to_simplified("We have completed it.") == "We have completed it."

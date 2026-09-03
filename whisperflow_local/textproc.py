@@ -100,6 +100,36 @@ def to_hk(text: str) -> str:
     return _CC_S2HK.convert(text) if _CC_S2HK else text
 
 
+def to_simplified(text: str) -> str:
+    """Any variant -> simplified (OpenCC t2s). No-op if OpenCC is missing."""
+    return _t2s(text)
+
+
+# Script the user explicitly asked for in a clarify answer. Prompting alone is
+# not reliable here: measured against the live model, answering "简体中文" gave
+# simplified but the English phrasing "Simplified Chinese" still came back in
+# traditional, because the prompt and the spoken request are both traditional
+# Cantonese and prime the script. When the user has actually named a script,
+# convert deterministically instead of hoping.
+_SIMPLIFIED_MARKERS = ("简体", "簡體", "简中", "簡中", "simplified", "zh-cn",
+                       "zh-hans", "hans")
+_TRADITIONAL_MARKERS = ("繁體", "繁体", "正體", "正体", "traditional", "zh-tw",
+                        "zh-hk", "hant")
+
+
+def requested_script(answers: list):
+    """'simplified' | 'traditional' | None from the user's clarify answers."""
+    for raw in reversed(list(answers or [])):
+        low = str(raw).strip().lower()
+        if not low:
+            continue
+        if any(m in low for m in _SIMPLIFIED_MARKERS):
+            return "simplified"
+        if any(m in low for m in _TRADITIONAL_MARKERS):
+            return "traditional"
+    return None
+
+
 def quick_clean(text: str, vocab: list = None, hk: bool = True) -> str:
     """Deterministic cleanup for the no-LLM fast path: HK script, CJK/Latin
     spacing normalization, punctuation spacing, canonical vocabulary casing."""

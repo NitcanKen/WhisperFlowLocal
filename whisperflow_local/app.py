@@ -40,7 +40,9 @@ from .textproc import (
     parse_vocab_entry,
     parse_voice_commands,
     quick_clean,
+    requested_script,
     should_use_llm,
+    to_simplified,
     strip_punctuation,
     to_hk,
     vocab_terms,
@@ -595,7 +597,15 @@ class WhisperFlowApp(rumps.App):
             _notify(tr("notify_llm_unavailable_title"), str(exc))
             return
 
-        if self.config.get("traditional_hk"):
+        # NOT an unconditional to_hk(): traditional_hk exists because ASR
+        # emits simplified for Cantonese dictation, and forcing s2hk here
+        # would silently overrule the user when they ask for simplified.
+        # Convert only when they actually named a script, because the model
+        # does not reliably honour that instruction on its own.
+        script = requested_script(answers)
+        if script == "simplified":
+            out = to_simplified(out)
+        elif script == "traditional":
             out = to_hk(out)
         if not out.strip():
             self.state = "error"
