@@ -189,6 +189,8 @@ class HotkeyManager:
     Two HELD bindings share one push-to-talk key: pressing it alone dictates,
     pressing it with the generation combo's modifiers starts a content
     generation. on_ptt_down/on_ptt_up receive the mode ("dictate"|"generate").
+    Modifier order does not matter — adding the modifier after the key is
+    already down upgrades the session in flight and calls on_ptt_mode.
 
     Callbacks fire off the listener thread (see _fire) — they must not touch
     AppKit.
@@ -196,10 +198,13 @@ class HotkeyManager:
 
     def __init__(self, ptt_key_name: str, toggle_combo: str,
                  generate_combo: str = "",
-                 *, on_ptt_down, on_ptt_up, on_toggle):
+                 *, on_ptt_down, on_ptt_up, on_toggle, on_ptt_mode=None):
         self.on_ptt_down = on_ptt_down
         self.on_ptt_up = on_ptt_up
         self.on_toggle = on_toggle
+        # Optional: told when a hold in flight changes mode, so the UI can
+        # show that generation is now armed.
+        self.on_ptt_mode = on_ptt_mode
         self._lock = threading.Lock()
         self._holds = self._build_holds(ptt_key_name, generate_combo)
         # Which hold binding owns the keyboard right now (None = none). The
@@ -247,6 +252,7 @@ class HotkeyManager:
             if self._suppressed:
                 return
             down_mode = None
+            upgraded = None
             if self._hold_key is None:      # one hold session at a time
                 for mode, (spec_mods, spec_key) in self._holds.items():
                     if hold_matches(self._mods_held, key, spec_mods, spec_key):
@@ -263,8 +269,22 @@ class HotkeyManager:
                                       f"ctx={sorted(context_mods(self._mods_held, key))}")
             elif _keys_equal(key, self._hold_key):
                 pass                        # auto-repeat, expected
-            else:
-                log("hotkey", f"{key!r} ignored: {self._hold_mode} hold in flight")
+            elif mod:
+                # A modifier arriving DURING a hold upgrades the session.
+                # People reach for the push-to-talk key first and add the
+                # modifier a moment later; latching the mode at press time
+                # made "hold both keys" silently behave as plain dictation.
+                # Only upgrades happen: _holds is most-specific-first, so
+                # stopping at the current mode means we never downgrade, and
+                # letting go of the modifier mid-sentence cannot undo it.
+                for mode, (spec_mods, spec_key) in self._holds.items():
+                    if mode == self._hold_mode:
+                        break
+                    if hold_matches(self._mods_held, self._hold_key,
+                                    spec_mods, spec_key):
+                        self._hold_mode = mode
+                        upgraded = mode
+                        break
             fire_toggle = False
             if (self._combo_trigger is not None
                     and _keys_equal(key, self._combo_trigger)
@@ -274,6 +294,10 @@ class HotkeyManager:
                 fire_toggle = True
         if down_mode:
             self._fire(partial(self.on_ptt_down, down_mode))
+        if upgraded:
+            log("hotkey", f"hold upgraded to {upgraded}")
+            if self.on_ptt_mode is not None:
+                self._fire(partial(self.on_ptt_mode, upgraded))
         if fire_toggle:
             self._fire(self.on_toggle)
 

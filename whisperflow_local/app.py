@@ -126,6 +126,7 @@ class WhisperFlowApp(rumps.App):
             on_ptt_down=self._begin_recording,
             on_ptt_up=self._end_recording,
             on_toggle=self._toggle_recording,
+            on_ptt_mode=self._recording_mode_changed,
         )
         self.hotkeys.start()
 
@@ -391,6 +392,16 @@ class WhisperFlowApp(rumps.App):
         # Generation is a different pipeline (ASR -> LLM writes the text ->
         # paste); it must not re-enter the formatting-profile logic.
         self._jobs.put(("generate" if mode == "generate" else "transcribe", audio))
+
+    def _recording_mode_changed(self, mode: str):
+        """A modifier arrived after the hold started (people press the
+        push-to-talk key first and add Shift a moment later). Reflect the
+        upgrade so the user can see generation is armed mid-utterance."""
+        if self.state != "recording":
+            return
+        self._session_mode = mode
+        self.state_msg = tr("status_recording_gen" if mode == "generate"
+                            else "status_recording")
 
     def _toggle_recording(self):
         # The hands-free hotkey and the menu item always dictate.

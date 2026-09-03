@@ -392,13 +392,49 @@ def test_releasing_shift_mid_hold_keeps_the_generation_session():
     assert counts["down"] == ["generate"] and counts["up"] == ["generate"]
 
 
-def test_shift_pressed_after_the_ptt_key_does_not_switch_mode():
+def test_shift_pressed_after_the_ptt_key_upgrades_the_session():
+    # Regression (found in app.log): people reach for the push-to-talk key
+    # first and add Shift a moment later. Latching the mode at press time
+    # made "hold both keys" behave as plain dictation, which is exactly what
+    # the user reported. Release carries the upgraded mode, and releasing
+    # Shift mid-utterance must not undo it.
+    modes = []
     mgr, counts = make_mgr()
+    mgr.on_ptt_mode = modes.append
     mgr._on_press(keyboard.Key.alt_r)
+    assert counts["down"] == ["dictate"]
     mgr._on_press(keyboard.Key.shift)
+    assert modes == ["generate"]
     mgr._on_release(keyboard.Key.shift)
     mgr._on_release(keyboard.Key.alt_r)
-    assert counts["down"] == ["dictate"] and counts["up"] == ["dictate"]
+    assert counts["up"] == ["generate"]
+
+
+def test_right_hand_modifiers_upgrade_too():
+    # The user's actual keys: RIGHT shift, RIGHT option.
+    mgr, counts = make_mgr()
+    mgr._on_press(keyboard.Key.alt_r)
+    mgr._on_press(keyboard.Key.shift_r)
+    mgr._on_release(keyboard.Key.alt_r)
+    assert counts["up"] == ["generate"]
+
+
+def test_an_unrelated_modifier_mid_hold_does_not_upgrade():
+    mgr, counts = make_mgr()
+    mgr._on_press(keyboard.Key.alt_r)
+    mgr._on_press(keyboard.Key.cmd)
+    mgr._on_release(keyboard.Key.alt_r)
+    assert counts["up"] == ["dictate"]
+
+
+def test_upgrade_never_downgrades():
+    # Once generation is armed, a further modifier cannot drop it back.
+    mgr, counts = make_mgr()
+    mgr._on_press(keyboard.Key.shift)
+    mgr._on_press(keyboard.Key.alt_r)
+    mgr._on_press(keyboard.Key.cmd)
+    mgr._on_release(keyboard.Key.alt_r)
+    assert counts["down"] == ["generate"] and counts["up"] == ["generate"]
 
 
 def test_an_unrelated_modifier_still_dictates():
