@@ -1,6 +1,7 @@
 """Tests for the insert-path decision (Accessibility-aware degradation)
 and the waveform HUD's pure geometry helpers."""
-from whisperflow_local.injector import decide_path
+import whisperflow_local.injector as injector
+from whisperflow_local.injector import TYPING_MAX_SECONDS, decide_path, typing_plan
 from whisperflow_local.overlay import (
     N_BARS,
     PILL_H,
@@ -40,6 +41,81 @@ def test_no_accessibility_degrades_to_clipboard_no_perm():
 
 def test_trusted_uses_auto_paste():
     assert decide_path(copy_only=False, trusted=True) == "auto"
+
+
+# ---------------------------------------------------- typewriter pacing
+
+def _duration(n, **kw):
+    chunk, delay = typing_plan(n, **kw)
+    return -(-n // chunk) * delay  # bursts * gap
+
+
+def test_short_text_types_one_char_at_a_time_at_cps():
+    chunk, delay = typing_plan(20, cps=60.0)
+    assert chunk == 1
+    assert abs(delay - 1 / 60.0) < 1e-6
+
+
+def test_long_text_widens_bursts_instead_of_dragging():
+    chunk, _ = typing_plan(600, cps=60.0)
+    assert chunk > 1
+    # However long the text, the whole insert stays inside the budget.
+    for n in (1, 5, 50, 200, 600, 5000):
+        assert _duration(n) <= TYPING_MAX_SECONDS + 1e-6
+
+
+def test_plan_is_empty_for_empty_text():
+    assert typing_plan(0) == (0, 0.0)
+
+
+# ------------------------------------------------ typewriter safety (E1/E3)
+
+def test_typewrite_declines_tabs_and_carriage_returns():
+    # Synthesized Tab moves focus and \r is a Return: neither is text, and
+    # declining here leaves insert() to paste the text intact instead.
+    assert injector.typewrite("a\tb") is False
+    assert injector.typewrite("a\rb") is False
+    assert injector.typewrite("") is False
+
+
+def test_typewrite_sends_every_character_in_order(monkeypatch):
+    sent = []
+    monkeypatch.setattr(injector._kb, "type", sent.append)
+    monkeypatch.setattr(injector.time, "sleep", lambda _s: None)
+    assert injector.typewrite("你好，world!") is True
+    assert "".join(sent) == "你好，world!"
+
+
+def test_typewrite_pastes_newlines_from_a_pasteboard_staged_once(monkeypatch):
+    events = []
+    copies = []
+    monkeypatch.setattr(injector._kb, "type", lambda t: events.append(t))
+    monkeypatch.setattr(injector, "_paste_once", lambda: events.append("\n"))
+    monkeypatch.setattr(injector.pyperclip, "paste", lambda: "old")
+    monkeypatch.setattr(injector.pyperclip, "copy", copies.append)
+    monkeypatch.setattr(injector.time, "sleep", lambda _s: None)
+    assert injector.typewrite("ab\ncd") is True
+    assert "".join(events) == "ab\ncd"
+    # Staged with the newline, never re-staged mid-flight, restored at the end.
+    assert copies == ["\n", "old"]
+
+
+def test_typewrite_finishes_a_failed_insert_instead_of_duplicating(monkeypatch):
+    typed = []
+    pasted = []
+
+    def explode(piece):
+        if len(typed) == 2:
+            raise RuntimeError("event tap died")
+        typed.append(piece)
+
+    monkeypatch.setattr(injector._kb, "type", explode)
+    monkeypatch.setattr(injector, "paste_text",
+                        lambda t, restore_clipboard=True: pasted.append(t) or True)
+    monkeypatch.setattr(injector.time, "sleep", lambda _s: None)
+    assert injector.typewrite("abcdef") is True
+    # The remainder is pasted once; insert() must not re-run the whole text.
+    assert "".join(typed) + pasted[0] == "abcdef"
 
 
 # ---------------------------------------------------- waveform helpers (A4)

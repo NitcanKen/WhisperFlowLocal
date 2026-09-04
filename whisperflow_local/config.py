@@ -69,6 +69,11 @@ DEFAULTS = {
     #                  written Chinese.
     "profile": "Verbatim",
     "copy_only": False,
+    # Land the result as a fast burst of keystrokes instead of one paste, so
+    # dictation reads as typing. Characters/second for short utterances; a long
+    # one widens the bursts to stay inside injector.TYPING_MAX_SECONDS.
+    "typing_effect": True,
+    "typing_cps": 60.0,
     "sounds": True,
     # Output punctuation on/off (applies after ASR + LLM formatting)
     "punctuation": True,

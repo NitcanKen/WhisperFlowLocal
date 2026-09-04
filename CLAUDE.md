@@ -30,7 +30,7 @@ whisperflow_local/
   breaker.py    # CircuitBreaker: 3-strike trip + cooldown re-probe, shared by both routers
   textproc.py   # voice commands, custom dictionary, punctuation, OpenCC s2hk, guard_verbatim
   hotkeys.py keycap.py  # global hold bindings (dictate / Shift+PTT = generate) + toggle (pynput)
-  injector.py   # clipboard + synthesized ⌘V paste, then restore prior clipboard
+  injector.py   # typewriter keystroke burst (default) / clipboard + ⌘V paste, then restore prior clipboard
   overlay.py    # native waveform HUD shown while recording
   config.py paths.py    # JSON config + ~/Library/Application Support/WhisperFlow-Local
   history.py i18n.py permissions.py launchagent.py frontmost.py audio.py

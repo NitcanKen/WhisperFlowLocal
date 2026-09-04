@@ -227,6 +227,9 @@ class WhisperFlowApp(rumps.App):
         self.item_copy_only = rumps.MenuItem(tr("menu_copy_only"),
                                              callback=self._toggle_copy_only)
         self.menu_settings.add(self.item_copy_only)
+        self.item_typing = rumps.MenuItem(tr("menu_typing"),
+                                          callback=self._toggle_typing)
+        self.menu_settings.add(self.item_typing)
         self.item_punct = rumps.MenuItem(tr("menu_punct"),
                                          callback=self._toggle_punct)
         self.menu_settings.add(self.item_punct)
@@ -286,6 +289,7 @@ class WhisperFlowApp(rumps.App):
         for code, item in self._backend_items.items():
             item.state = 1 if code == backend else 0
         self.item_copy_only.state = 1 if self.config.get("copy_only") else 0
+        self.item_typing.state = 1 if self.config.get("typing_effect") else 0
         self.item_punct.state = 1 if self.config.get("punctuation") else 0
         self.item_sounds.state = 1 if self.config.get("sounds") else 0
         self.item_login.state = 1 if launchagent.is_enabled() else 0
@@ -526,7 +530,8 @@ class WhisperFlowApp(rumps.App):
             formatted = strip_punctuation(formatted)
 
         if formatted:
-            path = insert(formatted, copy_only=self.config.get("copy_only"))
+            path = insert(formatted, copy_only=self.config.get("copy_only"),
+                          **self._typing_opts())
             log("insert", f"path={path} text={formatted[:60]!r}")
             if parsed.press_enter and path in ("paste", "type"):
                 press_enter()
@@ -613,7 +618,8 @@ class WhisperFlowApp(rumps.App):
             play("error", self.config.get("sounds"))
             return
 
-        path = insert(out, copy_only=self.config.get("copy_only"))
+        path = insert(out, copy_only=self.config.get("copy_only"),
+                      **self._typing_opts())
         log("insert", f"path={path} generated={out[:60]!r}")
         self._last_inserted = out
         self._last_insert_path = path
@@ -840,8 +846,17 @@ class WhisperFlowApp(rumps.App):
         self.config.set("llm_enabled", not self.config.get("llm_enabled"))
         self._sync_checkmarks()
 
+    def _typing_opts(self) -> dict:
+        """Typewriter arguments for insert(), straight from the config."""
+        return {"typing": bool(self.config.get("typing_effect")),
+                "cps": float(self.config.get("typing_cps"))}
+
     def _toggle_copy_only(self, _):
         self.config.set("copy_only", not self.config.get("copy_only"))
+        self._sync_checkmarks()
+
+    def _toggle_typing(self, _):
+        self.config.set("typing_effect", not self.config.get("typing_effect"))
         self._sync_checkmarks()
 
     def _toggle_punct(self, _):
@@ -857,7 +872,8 @@ class WhisperFlowApp(rumps.App):
         self._sync_checkmarks()
 
     def _reinsert(self, sender):
-        insert(sender._entry_text, copy_only=self.config.get("copy_only"))
+        insert(sender._entry_text, copy_only=self.config.get("copy_only"),
+               **self._typing_opts())
         self.state_msg = tr("status_reinserted")
 
     def _copy_last(self, _):

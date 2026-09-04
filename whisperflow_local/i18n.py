@@ -149,6 +149,7 @@ S = {
     ),
     "dlg_vocab_delete": ("Delete 「{item}」?", "刪除「{item}」？"),
     "menu_copy_only": ("Copy Only (no auto-paste)", "只複製（唔自動貼上）"),
+    "menu_typing": ("Typing Effect", "打字機效果"),
     "menu_punct": ("Punctuation", "標點符號"),
     "menu_sounds": ("Sound Cues", "音效提示"),
     "menu_login": ("Launch at Login", "登入時自動啟動"),
