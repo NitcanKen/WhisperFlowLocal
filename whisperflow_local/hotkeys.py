@@ -217,6 +217,7 @@ class HotkeyManager:
         # switch a generation session into a dictation one.
         self._hold_key = None
         self._hold_mode = None
+        self._hold_state_confirmed = False
         self._released_since = None
         self._combo_mods, self._combo_trigger = parse_combo(toggle_combo)
         self._combo_latched = False
@@ -265,6 +266,7 @@ class HotkeyManager:
                 for mode, (spec_mods, spec_key) in self._holds.items():
                     if hold_matches(self._mods_held, key, spec_mods, spec_key):
                         self._hold_key, self._hold_mode = key, mode
+                        self._hold_state_confirmed = False
                         self._released_since = None
                         down_mode = mode
                         break
@@ -328,6 +330,7 @@ class HotkeyManager:
             if self._hold_key is not None and _keys_equal(key, self._hold_key):
                 up_mode = self._hold_mode
                 self._hold_key = self._hold_mode = None
+                self._hold_state_confirmed = False
                 self._released_since = None
             if up_mode:
                 self._fire(partial(log, "hotkey", f"hold up {key!r} mode={up_mode}"))
@@ -338,8 +341,9 @@ class HotkeyManager:
 
         Runs on the callback pump, including while idle. Only a latched hold
         can end here; hands-free recording has no hold key. Require the key
-        to stay released for 150 ms so transient state/event timing cannot
-        cut off speech. Slow recorder startup still finishes before its up.
+        to first be observed down, then stay released for 150 ms. A reader
+        that always reports false must never cut off speech. Slow recorder
+        startup still finishes before its up.
         """
         with self._lock:
             listener = self._listener
@@ -349,7 +353,11 @@ class HotkeyManager:
             if self._hold_key is None:
                 return
             pressed = listener.key_is_pressed(self._hold_key)
-            if pressed is not False:
+            if pressed is True and not self._hold_state_confirmed:
+                self._hold_state_confirmed = True
+                self._fire(partial(log, "hotkey",
+                                   f"hold state confirmed {self._hold_key!r}"))
+            if pressed is not False or not self._hold_state_confirmed:
                 self._released_since = None
                 return
             now = time.monotonic()
@@ -450,6 +458,7 @@ class HotkeyManager:
             self._suppressed = bool(on)
             if on:
                 self._hold_key = self._hold_mode = None
+                self._hold_state_confirmed = False
                 self._released_since = None
                 self._combo_latched = False
 
@@ -501,5 +510,6 @@ class HotkeyManager:
             # Drop any in-flight hold: its key may no longer be bound, and a
             # stuck session would swallow every later press.
             self._hold_key = self._hold_mode = None
+            self._hold_state_confirmed = False
             self._released_since = None
             self._combo_latched = False

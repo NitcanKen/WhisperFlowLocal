@@ -96,3 +96,42 @@ def test_disabled_tap_is_reenabled_without_decoding_a_null_event(notification):
 
 def test_unknown_key_state_does_not_claim_a_release():
     assert MacOSKeyboardListener.key_is_pressed(keyboard.KeyCode.from_char("x")) is None
+
+
+@pytest.mark.parametrize("key,held_flags,opposite_flags", [
+    (keyboard.Key.alt_r, 0x80040, 0x80020),
+    (keyboard.Key.alt_l, 0x80020, 0x80040),
+    (keyboard.Key.shift_r, 0x20004, 0x20002),
+    (keyboard.Key.shift_l, 0x20002, 0x20004),
+    (keyboard.Key.ctrl_r, 0x42000, 0x40001),
+    (keyboard.Key.ctrl_l, 0x40001, 0x42000),
+    (keyboard.Key.cmd_r, 0x100010, 0x100008),
+    (keyboard.Key.cmd_l, 0x100008, 0x100010),
+])
+def test_modifier_state_uses_flags_even_when_key_bitmap_says_up(
+        monkeypatch, key, held_flags, opposite_flags):
+    # Native modifiers arrive as flagsChanged. The ordinary key bitmap can
+    # stay false throughout the hold: that caused the one-second regression.
+    flags = {"value": held_flags}
+    monkeypatch.setattr(Quartz, "CGEventSourceFlagsState", lambda source: flags["value"])
+    monkeypatch.setattr(Quartz, "CGEventSourceKeyState", lambda source, vk: False)
+    listener = MacOSKeyboardListener()
+    assert listener.key_is_pressed(key) is True
+    flags["value"] = opposite_flags
+    assert listener.key_is_pressed(key) is False
+    flags["value"] = 0
+    assert listener.key_is_pressed(key) is False
+
+
+def test_aggregate_only_modifier_state_does_not_claim_a_side_was_released(monkeypatch):
+    monkeypatch.setattr(Quartz, "CGEventSourceFlagsState", lambda source: 0x80000)
+    monkeypatch.setattr(Quartz, "CGEventSourceKeyState", lambda source, vk: False)
+    assert MacOSKeyboardListener.key_is_pressed(keyboard.Key.alt_r) is None
+
+
+def test_ordinary_key_state_still_uses_the_key_bitmap(monkeypatch):
+    pressed = {"value": True}
+    monkeypatch.setattr(Quartz, "CGEventSourceKeyState", lambda source, vk: pressed["value"])
+    assert MacOSKeyboardListener.key_is_pressed(keyboard.Key.f18) is True
+    pressed["value"] = False
+    assert MacOSKeyboardListener.key_is_pressed(keyboard.Key.f18) is False

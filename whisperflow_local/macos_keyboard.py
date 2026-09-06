@@ -8,17 +8,17 @@ import Quartz
 from pynput import keyboard
 
 
-# Virtual key -> (this side, either side), from IOKit/IOLLEvent.h's
+# Virtual key -> (this side, either side, family), from IOKit/IOLLEvent.h's
 # NX_DEVICE*KEYMASK constants. The public CGEvent modifier flags combine sides.
 _MODIFIER_MASKS = {
-    56: (0x0002, 0x0006),  # left Shift
-    60: (0x0004, 0x0006),  # right Shift
-    59: (0x0001, 0x2001),  # left Control
-    62: (0x2000, 0x2001),  # right Control
-    58: (0x0020, 0x0060),  # left Option
-    61: (0x0040, 0x0060),  # right Option
-    55: (0x0008, 0x0018),  # left Command
-    54: (0x0010, 0x0018),  # right Command
+    56: (0x0002, 0x0006, Quartz.kCGEventFlagMaskShift),  # left Shift
+    60: (0x0004, 0x0006, Quartz.kCGEventFlagMaskShift),  # right Shift
+    59: (0x0001, 0x2001, Quartz.kCGEventFlagMaskControl),  # left Control
+    62: (0x2000, 0x2001, Quartz.kCGEventFlagMaskControl),  # right Control
+    58: (0x0020, 0x0060, Quartz.kCGEventFlagMaskAlternate),  # left Option
+    61: (0x0040, 0x0060, Quartz.kCGEventFlagMaskAlternate),  # right Option
+    55: (0x0008, 0x0018, Quartz.kCGEventFlagMaskCommand),  # left Command
+    54: (0x0010, 0x0018, Quartz.kCGEventFlagMaskCommand),  # right Command
 }
 _TAP_DISABLED = {
     Quartz.kCGEventTapDisabledByTimeout,
@@ -65,11 +65,11 @@ class MacOSKeyboardListener(keyboard.Listener):
             if masks is not None:
                 flags = Quartz.CGEventGetFlags(event)
                 key = self._event_to_key(event)
-                side, either = masks
+                side, either, family = masks
                 # Some synthesized events only supply the aggregate flag.
                 # Use that fallback only when neither side bit is present.
                 pressed = bool(flags & side) if flags & either else bool(
-                    flags & self._MODIFIER_FLAGS.get(key, 0))
+                    flags & family)
                 self._flags = flags
                 (self.on_press if pressed else self.on_release)(key, injected)
                 return
@@ -79,12 +79,25 @@ class MacOSKeyboardListener(keyboard.Listener):
     def key_is_pressed(key):
         """Read the session's current key state, independently of tap delivery.
 
-        Session state also includes remapped/injected keys. Unknown/media keys
-        return None so a state we cannot inspect never ends a valid hold.
+        Modifiers use flags state: their flagsChanged events need not update
+        the ordinary key bitmap. CGEventSourceKeyState can therefore report
+        false for Right Option throughout a real physical hold.
+
+        Unknown/media keys and modifier flags without side information return
+        None so an ambiguous state never ends a valid hold.
         """
         code = key.value if isinstance(key, keyboard.Key) else key
         vk = getattr(code, "vk", None)
         if vk is None or getattr(code, "_is_media", False):
             return None
+        masks = _MODIFIER_MASKS.get(vk)
+        if masks is not None:
+            flags = Quartz.CGEventSourceFlagsState(
+                Quartz.kCGEventSourceStateCombinedSessionState)
+            side, either, family = masks
+            if flags & either:
+                return bool(flags & side)
+            # An aggregate flag alone cannot tell which side is held.
+            return None if flags & family else False
         return bool(Quartz.CGEventSourceKeyState(
             Quartz.kCGEventSourceStateCombinedSessionState, vk))
