@@ -18,6 +18,7 @@ from whisperflow_local.hotkeys import (
     resolve_key,
     retarget_hold,
 )
+from whisperflow_local.macos_keyboard import MacOSKeyboardListener
 
 
 def make_mgr(ptt="alt_r", combo="<cmd>+<shift>+d", gen="<shift>+<alt_r>"):
@@ -544,3 +545,119 @@ def test_capture_still_wins_over_suppression():
     mgr._on_press(keyboard.Key.f18)
     assert session.state == "done" and session.result == "f18"
     assert counts["down"] == []
+
+
+# ---------------------------------------------------- lost-release recovery
+
+@pytest.fixture
+def recovery_clock(monkeypatch):
+    # No global key events: supply only the native state query and clock.
+    state = {"pressed": True, "now": 10.0}
+    monkeypatch.setattr(MacOSKeyboardListener, "key_is_pressed",
+                        staticmethod(lambda key: state["pressed"]))
+    monkeypatch.setattr("whisperflow_local.hotkeys.time.monotonic", lambda: state["now"])
+    return state
+
+
+def attach_state_reader(mgr):
+    mgr._listener = MacOSKeyboardListener(on_press=mgr._on_press, on_release=mgr._on_release)
+
+
+@pytest.mark.parametrize("generate", [False, True])
+def test_missing_release_stops_once_and_preserves_mode(recovery_clock, generate):
+    mgr, counts = make_mgr()
+    attach_state_reader(mgr)
+    mgr._on_press(keyboard.Key.alt_r)
+    if generate:
+        mgr._on_press(keyboard.Key.shift_r)
+    recovery_clock["pressed"] = False
+    mgr._check_key_state()
+    assert counts["up"] == []
+    recovery_clock["now"] += 0.2
+    mgr._check_key_state()
+    mgr._check_key_state()
+    mgr._on_release(keyboard.Key.alt_r)  # late delivery must not duplicate up
+    assert counts["up"] == ["generate" if generate else "dictate"]
+    assert mgr._hold_key is None
+    mgr._on_press(keyboard.Key.alt_r)
+    assert len(counts["down"]) == 2  # the next hold is usable without restart
+
+
+def test_recovery_never_ends_a_held_key_or_a_transient_false_read(recovery_clock):
+    mgr, counts = make_mgr()
+    attach_state_reader(mgr)
+    mgr._on_press(keyboard.Key.alt_r)
+    mgr._check_key_state()
+    recovery_clock["now"] += 100
+    mgr._check_key_state()
+    assert counts["up"] == []
+    recovery_clock["pressed"] = False
+    mgr._check_key_state()
+    recovery_clock["now"] += 0.05
+    recovery_clock["pressed"] = True
+    mgr._check_key_state()
+    recovery_clock["now"] += 1
+    recovery_clock["pressed"] = False
+    mgr._check_key_state()
+    assert counts["up"] == []
+    recovery_clock["now"] += 0.2
+    mgr._check_key_state()
+    assert counts["up"] == ["dictate"]
+
+
+def test_unknown_state_and_hands_free_are_not_stopped(recovery_clock):
+    mgr, counts = make_mgr()
+    attach_state_reader(mgr)
+    for key in (keyboard.Key.cmd, keyboard.Key.shift, D):
+        mgr._on_press(key)
+    recovery_clock["pressed"] = False
+    mgr._check_key_state()
+    recovery_clock["now"] += 1
+    mgr._check_key_state()
+    assert counts == {"down": [], "up": [], "toggle": 1}
+    mgr._on_press(keyboard.Key.alt_r)
+    recovery_clock["pressed"] = None
+    mgr._check_key_state()
+    recovery_clock["now"] += 1
+    mgr._check_key_state()
+    assert counts["up"] == []
+
+
+def test_pump_recovers_missing_release_after_slow_start_without_more_events(monkeypatch):
+    started, unblock, stopped = threading.Event(), threading.Event(), threading.Event()
+    order = []
+
+    def down(mode):
+        started.set()
+        unblock.wait(2)
+        order.append("down")
+
+    def up(mode):
+        order.append("up")
+        stopped.set()
+
+    mgr = HotkeyManager("alt_r", "", on_ptt_down=down, on_ptt_up=up, on_toggle=lambda: None)
+    attach_state_reader(mgr)
+    monkeypatch.setattr(MacOSKeyboardListener, "key_is_pressed", staticmethod(lambda key: False))
+    mgr._start_pump()
+    try:
+        mgr._on_press(keyboard.Key.alt_r)
+        assert started.wait(1)
+        assert not stopped.is_set()
+        unblock.set()
+        assert stopped.wait(1)
+        assert order == ["down", "up"]
+    finally:
+        unblock.set()
+        mgr._stop_pump()
+
+
+def test_modifier_family_stays_held_until_both_sides_are_released():
+    mgr, counts = make_mgr()
+    mgr._on_press(keyboard.Key.shift_l)
+    mgr._on_press(keyboard.Key.shift_r)
+    mgr._on_release(keyboard.Key.shift_l)
+    mgr._on_press(keyboard.Key.alt_r)
+    assert counts["down"] == ["generate"]
+    mgr._on_release(keyboard.Key.shift_r)
+    assert "shift" not in mgr._mods_held

@@ -15,11 +15,13 @@ Requires the macOS Input Monitoring permission.
 """
 import queue
 import threading
+import time
 from functools import partial
 
 from pynput import keyboard
 
 from .applog import log
+from .macos_keyboard import MacOSKeyboardListener
 
 # Left/right/plain modifier variants collapse to one canonical name.
 MODIFIER_MAP = {}
@@ -35,6 +37,8 @@ for _canon, _names in {
             MODIFIER_MAP[_key] = _canon
 
 MOD_ORDER = ("cmd", "ctrl", "alt", "shift")
+RELEASE_CHECK_INTERVAL = 0.05
+RELEASE_CONFIRM_SECONDS = 0.15
 
 
 def resolve_key(name: str):
@@ -205,16 +209,19 @@ class HotkeyManager:
         # Optional: told when a hold in flight changes mode, so the UI can
         # show that generation is now armed.
         self.on_ptt_mode = on_ptt_mode
-        self._lock = threading.Lock()
+        # Recovery reuses _on_release while atomically checking a hold.
+        self._lock = threading.RLock()
         self._holds = self._build_holds(ptt_key_name, generate_combo)
         # Which hold binding owns the keyboard right now (None = none). The
         # mode is latched at press time, so releasing Shift mid-hold cannot
         # switch a generation session into a dictation one.
         self._hold_key = None
         self._hold_mode = None
+        self._released_since = None
         self._combo_mods, self._combo_trigger = parse_combo(toggle_combo)
         self._combo_latched = False
         self._mods_held = set()
+        self._modifier_keys_held = set()
         self._capture = None
         # Set while the clarify panel owns the keyboard: the panel is key, so
         # the digits are already going to it — the listener must merely stop
@@ -244,6 +251,7 @@ class HotkeyManager:
         mod = MODIFIER_MAP.get(key)
         with self._lock:
             if mod:
+                self._modifier_keys_held.add(key)
                 self._mods_held.add(mod)
             capture = self._capture
             if capture is not None and capture.state == "waiting":
@@ -257,6 +265,7 @@ class HotkeyManager:
                 for mode, (spec_mods, spec_key) in self._holds.items():
                     if hold_matches(self._mods_held, key, spec_mods, spec_key):
                         self._hold_key, self._hold_mode = key, mode
+                        self._released_since = None
                         down_mode = mode
                         break
                 else:
@@ -264,9 +273,9 @@ class HotkeyManager:
                     # "my hotkey is dead" symptom — record why.
                     if any(_keys_equal(key, k)
                            for _, k in self._holds.values() if k is not None):
-                        log("hotkey", f"no hold matched {key!r} "
-                                      f"mods={sorted(self._mods_held)} "
-                                      f"ctx={sorted(context_mods(self._mods_held, key))}")
+                        self._fire(partial(log, "hotkey", f"no hold matched {key!r} "
+                                           f"mods={sorted(self._mods_held)} "
+                                           f"ctx={sorted(context_mods(self._mods_held, key))}"))
             elif _keys_equal(key, self._hold_key):
                 pass                        # auto-repeat, expected
             elif mod:
@@ -292,20 +301,24 @@ class HotkeyManager:
                     and not self._combo_latched):
                 self._combo_latched = True
                 fire_toggle = True
-        if down_mode:
-            self._fire(partial(self.on_ptt_down, down_mode))
-        if upgraded:
-            log("hotkey", f"hold upgraded to {upgraded}")
-            if self.on_ptt_mode is not None:
-                self._fire(partial(self.on_ptt_mode, upgraded))
-        if fire_toggle:
-            self._fire(self.on_toggle)
+            # Enqueue while holding the state lock: recovery on the pump
+            # thread must never enqueue an up before this down.
+            if down_mode:
+                self._fire(partial(log, "hotkey", f"hold down {key!r} mode={down_mode}"))
+                self._fire(partial(self.on_ptt_down, down_mode))
+            if upgraded:
+                self._fire(partial(log, "hotkey", f"hold upgraded to {upgraded}"))
+                if self.on_ptt_mode is not None:
+                    self._fire(partial(self.on_ptt_mode, upgraded))
+            if fire_toggle:
+                self._fire(self.on_toggle)
 
     def _on_release(self, key):
         mod = MODIFIER_MAP.get(key)
         with self._lock:
             if mod:
-                self._mods_held.discard(mod)
+                self._modifier_keys_held.discard(key)
+                self._mods_held = {MODIFIER_MAP[k] for k in self._modifier_keys_held}
             if self._combo_latched and (
                     _keys_equal(key, self._combo_trigger) or mod):
                 self._combo_latched = False
@@ -315,8 +328,41 @@ class HotkeyManager:
             if self._hold_key is not None and _keys_equal(key, self._hold_key):
                 up_mode = self._hold_mode
                 self._hold_key = self._hold_mode = None
-        if up_mode:
-            self._fire(partial(self.on_ptt_up, up_mode))
+                self._released_since = None
+            if up_mode:
+                self._fire(partial(log, "hotkey", f"hold up {key!r} mode={up_mode}"))
+                self._fire(partial(self.on_ptt_up, up_mode))
+
+    def _check_key_state(self) -> None:
+        """Recover a missed release without depending on another key event.
+
+        Runs on the callback pump, including while idle. Only a latched hold
+        can end here; hands-free recording has no hold key. Require the key
+        to stay released for 150 ms so transient state/event timing cannot
+        cut off speech. Slow recorder startup still finishes before its up.
+        """
+        with self._lock:
+            listener = self._listener
+            if listener is None:
+                return
+            listener.check_health()
+            if self._hold_key is None:
+                return
+            pressed = listener.key_is_pressed(self._hold_key)
+            if pressed is not False:
+                self._released_since = None
+                return
+            now = time.monotonic()
+            if self._released_since is None:
+                self._released_since = now
+            elif now - self._released_since >= RELEASE_CONFIRM_SECONDS:
+                key = self._hold_key
+                self._fire(partial(log, "hotkey", f"recovered missed release {key!r}"))
+                self._on_release(key)
+
+    def _tap_recovered(self, reason) -> None:
+        # Logging must stay off the tap thread too.
+        self._fire(partial(log, "hotkey", f"event tap re-enabled: {reason}"))
 
     # -- off-thread callback dispatch ------------------------------------
     def _fire(self, callback) -> None:
@@ -324,13 +370,14 @@ class HotkeyManager:
 
         pynput invokes _on_press/_on_release synchronously on the macOS
         CGEventTap run-loop thread. macOS disables a tap whose callback runs
-        longer than ~1 s (kCGEventTapDisabledByTimeout) and pynput 1.8.2 never
+        too long (kCGEventTapDisabledByTimeout) and stock pynput 1.8.2 never
         re-enables it. recorder.start()/stop() (opening/closing the audio
         device — slow with Bluetooth mics or under load) could exceed that,
         silently killing the listener: the key release was never delivered, so
         recording never stopped and re-pressing the key did nothing until the
         app was restarted. Dispatching to a dedicated FIFO thread keeps the tap
-        callback effectively instant.
+        callback effectively instant. MacOSKeyboardListener additionally
+        re-enables the existing tap if macOS disables it anyway.
 
         Before the pump is started (unit tests, or pre-start()), run inline so
         callback effects are observable synchronously.
@@ -342,11 +389,16 @@ class HotkeyManager:
 
     def _pump_loop(self) -> None:
         while True:
-            callback = self._cb_queue.get()
-            if callback is None:  # shutdown sentinel
-                return
             try:
-                callback()
+                try:
+                    callback = self._cb_queue.get(timeout=RELEASE_CHECK_INTERVAL)
+                except queue.Empty:
+                    callback = None
+                else:
+                    if callback is None:  # shutdown sentinel
+                        return
+                    callback()
+                self._check_key_state()
             except Exception as exc:
                 # A failing callback must never kill the dispatch thread, or
                 # every later hotkey would be silently dropped.
@@ -398,6 +450,7 @@ class HotkeyManager:
             self._suppressed = bool(on)
             if on:
                 self._hold_key = self._hold_mode = None
+                self._released_since = None
                 self._combo_latched = False
 
     # -- capture mode ------------------------------------------------------
@@ -422,8 +475,9 @@ class HotkeyManager:
         if self._listener is not None:
             return
         self._start_pump()  # before the listener, so no event runs inline
-        self._listener = keyboard.Listener(
-            on_press=self._on_press, on_release=self._on_release
+        self._listener = MacOSKeyboardListener(
+            on_press=self._on_press, on_release=self._on_release,
+            on_tap_recovered=self._tap_recovered,
         )
         self._listener.daemon = True
         self._listener.start()
@@ -447,4 +501,5 @@ class HotkeyManager:
             # Drop any in-flight hold: its key may no longer be bound, and a
             # stuck session would swallow every later press.
             self._hold_key = self._hold_mode = None
+            self._released_since = None
             self._combo_latched = False
